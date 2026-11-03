@@ -1,0 +1,16 @@
+[package]
+name = "tgbooks-telegram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+grammers-client.workspace = true
+grammers-session.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,20 @@
+/target/
+.DS_Store
+Thumbs.db
+
+# Credentials are supplied at runtime, never compiled into the application.
+.env
+.env.*
+!.env.example
+*.session
+*.session-*
+*.session.*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+/data/
+/downloads/

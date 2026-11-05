@@ -1,0 +1,14 @@
+Telegram Books includes adapted text-input code from GPUI:
+
+  Zed Industries, Inc.
+  Copyright 2022 - 2025 Zed Industries, Inc.
+  https://github.com/zed-industries/zed/blob/504abf602a09edc3c7d5a4f4f60958aee335274f/crates/gpui/examples/input.rs
+
+The adapted portions are in src/ui/input.rs and retain the Apache License,
+Version 2.0, reproduced in LICENSE-APACHE.
+
+Modifications include zeroized buffers, masked rendering and IME readback,
+secret clipboard policy, single-line input limits, caret scrolling, accessible
+roles, application styling and authentication integration.
+
+Other original project code remains under the repository's MIT license.

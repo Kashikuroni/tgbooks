@@ -11,4 +11,11 @@ workspace = true
 
 [dependencies]
 tgbooks-core.workspace = true
+async-channel.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tgbooks-storage.workspace = true

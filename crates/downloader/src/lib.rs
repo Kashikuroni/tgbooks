@@ -1,5 +1,8 @@
-//! Download admission and FIFO ordering, independent of Telegram and the UI.
-//! File transfer and persistent queue recovery belong to subsequent iterations.
+//! Download admission and safe, streaming file storage without Telegram or UI.
+
+mod transfer;
+
+pub use transfer::LocalDownloader;
 
 use std::collections::{HashSet, VecDeque};
 

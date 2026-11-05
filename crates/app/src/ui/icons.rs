@@ -17,6 +17,7 @@ pub enum Icon {
     Minimize,
     Maximize,
     Close,
+    Check,
 }
 
 impl Icon {
@@ -30,6 +31,7 @@ impl Icon {
         Self::Minimize,
         Self::Maximize,
         Self::Close,
+        Self::Check,
     ];
 
     fn path(self) -> &'static str {
@@ -43,6 +45,7 @@ impl Icon {
             Self::Minimize => "icons/minimize.svg",
             Self::Maximize => "icons/maximize.svg",
             Self::Close => "icons/close.svg",
+            Self::Check => "icons/check.svg",
         }
     }
 
@@ -57,6 +60,7 @@ impl Icon {
             Self::Minimize => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><path d="M5 12h14"/></svg>"#,
             Self::Maximize => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><rect x="5" y="5" width="14" height="14" rx="1"/></svg>"#,
             Self::Close => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>"#,
+            Self::Check => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>"#,
         }
     }
 

@@ -56,6 +56,7 @@ impl BookFormat {
 /// Message identifiers are scoped to a channel; document IDs are not filenames.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct DownloadKey {
+    /// Bot API dialog ID for records discovered from Telegram channels.
     pub channel_id: i64,
     pub message_id: i32,
     pub document_id: i64,

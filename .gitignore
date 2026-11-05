@@ -16,5 +16,7 @@ Thumbs.db
 *.db
 *.db-*
 *.log
+tgbooks.app.lock
+.tgbooks-*.part
 /data/
 /downloads/

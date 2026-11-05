@@ -13,6 +13,9 @@ workspace = true
 async-channel.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

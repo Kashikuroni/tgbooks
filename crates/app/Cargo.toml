@@ -3,7 +3,7 @@ name = "tgbooks-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT AND Apache-2.0"
 publish.workspace = true
 default-run = "tgbooks"
 
@@ -19,7 +19,9 @@ gpui-tests = ["gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies]
 tgbooks-core.workspace = true
+tgbooks-downloader.workspace = true
 tgbooks-storage.workspace = true
+tgbooks-telegram.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 gpui.workspace = true
@@ -27,6 +29,8 @@ gpui_platform.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+unicode-segmentation.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

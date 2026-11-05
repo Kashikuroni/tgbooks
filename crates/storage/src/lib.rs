@@ -1,16 +1,19 @@
 //! SQLite and operating-system adapters. No UI or Telegram dependency.
 
+mod lock;
 mod paths;
 
 use std::{path::Path, time::Duration};
 
+pub use lock::{AppLock, AppLockError};
 pub use paths::{AppPaths, PathsError};
 use sqlx::{
     ConnectOptions, Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use tgbooks_core::{
-    DownloadHistory, DownloadKey, DownloadProgress, DownloadRecord, DownloadStatus,
+    DownloadError, DownloadHistory, DownloadKey, DownloadProgress, DownloadRecord,
+    DownloadRepository, DownloadStatus,
 };
 use thiserror::Error;
 
@@ -26,6 +29,7 @@ pub enum StorageError {
     InvalidData,
 }
 
+#[derive(Clone)]
 pub struct Storage {
     pool: SqlitePool,
 }
@@ -109,6 +113,79 @@ impl DownloadHistory for Storage {
     }
 }
 
+impl DownloadRepository for Storage {
+    async fn claim(&self, record: &DownloadRecord) -> Result<bool, DownloadError> {
+        if record.status != DownloadStatus::Queued || record.progress.downloaded_bytes() != 0 {
+            return Err(DownloadError::Storage);
+        }
+        let (_, total) = sql_progress(record)?;
+        let result = sqlx::query(
+            "INSERT INTO downloads
+             (channel_id, message_id, document_id, file_name, local_path, status, downloaded_bytes, total_bytes)
+             VALUES (?, ?, ?, ?, ?, 'queued', 0, ?)
+             ON CONFLICT (channel_id, message_id, document_id) DO UPDATE SET
+               file_name = excluded.file_name, local_path = excluded.local_path,
+               status = 'queued', downloaded_bytes = 0, total_bytes = excluded.total_bytes,
+               created_at = unixepoch()
+             WHERE downloads.status = 'failed'",
+        )
+        .bind(record.key.channel_id)
+        .bind(record.key.message_id)
+        .bind(record.key.document_id)
+        .bind(&record.file_name)
+        .bind(&record.local_path)
+        .bind(total)
+        .execute(&self.pool)
+        .await.map_err(|_| DownloadError::Storage)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn update(&self, record: &DownloadRecord) -> Result<(), DownloadError> {
+        let (downloaded, total) = sql_progress(record)?;
+        let result = sqlx::query(
+            "UPDATE downloads SET status = ?, downloaded_bytes = ?, total_bytes = ?
+             WHERE channel_id = ? AND message_id = ? AND document_id = ?
+               AND status IN ('queued', 'downloading') AND downloaded_bytes <= ?",
+        )
+        .bind(record.status.as_str())
+        .bind(downloaded)
+        .bind(total)
+        .bind(record.key.channel_id)
+        .bind(record.key.message_id)
+        .bind(record.key.document_id)
+        .bind(downloaded)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| DownloadError::Storage)?;
+        if result.rows_affected() != 1 {
+            return Err(DownloadError::Storage);
+        }
+        Ok(())
+    }
+
+    async fn recover_interrupted(&self) -> Result<(), DownloadError> {
+        sqlx::query(
+            "UPDATE downloads SET status = 'failed' WHERE status IN ('queued', 'downloading')",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|_| DownloadError::Storage)?;
+        Ok(())
+    }
+}
+
+fn sql_progress(record: &DownloadRecord) -> Result<(i64, Option<i64>), DownloadError> {
+    let downloaded =
+        i64::try_from(record.progress.downloaded_bytes()).map_err(|_| DownloadError::Storage)?;
+    let total = record
+        .progress
+        .total_bytes()
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| DownloadError::Storage)?;
+    Ok((downloaded, total))
+}
+
 fn decode_record(row: SqliteRow) -> Result<DownloadRecord, StorageError> {
     let status = match row.try_get::<&str, _>("status")? {
         "queued" => DownloadStatus::Queued,
@@ -186,6 +263,45 @@ mod tests {
         assert!(storage.insert_download(&first).await?);
         assert!(storage.insert_download(&other_channel).await?);
         assert_eq!(storage.list_downloads().await?.len(), 2);
+        storage.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn atomic_claim_retries_only_failed_records_and_completion_is_immutable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let storage = Storage::open(&temporary.path().join("downloads.sqlite3")).await?;
+        let mut job = record()?;
+        job.status = DownloadStatus::Queued;
+        job.progress = DownloadProgress::new(0, Some(100))?;
+        let (first, second) = tokio::join!(storage.claim(&job), storage.claim(&job));
+        assert_ne!(first?, second?);
+        job.status = DownloadStatus::Downloading;
+        job.progress = DownloadProgress::new(25, Some(100))?;
+        storage.update(&job).await?;
+        let mut stale = job.clone();
+        stale.progress = DownloadProgress::new(10, Some(100))?;
+        assert_eq!(storage.update(&stale).await, Err(DownloadError::Storage));
+        storage.recover_interrupted().await?;
+        assert_eq!(
+            storage.list_downloads().await?[0].status,
+            DownloadStatus::Failed
+        );
+        job.status = DownloadStatus::Queued;
+        job.progress = DownloadProgress::new(0, Some(100))?;
+        assert!(storage.claim(&job).await?);
+        job.status = DownloadStatus::Completed;
+        job.progress = DownloadProgress::new(100, Some(100))?;
+        storage.update(&job).await?;
+        let completed = job.clone();
+        job.status = DownloadStatus::Failed;
+        assert_eq!(storage.update(&job).await, Err(DownloadError::Storage));
+        storage.recover_interrupted().await?;
+        assert_eq!(storage.list_downloads().await?, vec![completed]);
+        job.status = DownloadStatus::Queued;
+        job.progress = DownloadProgress::new(0, Some(100))?;
+        assert!(!storage.claim(&job).await?);
         storage.close().await;
         Ok(())
     }

@@ -33,3 +33,7 @@ pub fn shortcut(macos: &'static str, windows: &'static str) -> &'static str {
         windows
     }
 }
+
+pub fn reveal_file(path: &str, cx: &mut gpui::App) {
+    cx.reveal_path(std::path::Path::new(path));
+}

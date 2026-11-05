@@ -1,6 +1,11 @@
+mod channels;
 mod chrome;
 mod components;
+mod downloads;
 mod icons;
+mod input;
+mod login;
+mod metrics;
 mod theme;
 
 #[cfg(feature = "gpui-tests")]
@@ -15,12 +20,12 @@ use gpui::{
     Role, SharedString, Task, Window, actions, div, prelude::*, px, size,
 };
 use tgbooks_core::{
-    AppInfo, BookFormat, CoreCommand, CoreEvent, DownloadRecord, DownloadStatus, ServiceFailure,
-    UiConnection,
+    AppInfo, AuthState, AuthStep, BookFormat, CatalogState, CoreCommand, CoreEvent, DownloadRecord,
+    DownloadStatus, ServiceFailure, TransferState, UiConnection,
 };
 
 use crate::platform;
-use components::{button, empty_state, icon_button, navigation_button, setting};
+use components::{button, icon_button, navigation_button, setting};
 use icons::{Icon, IconAssets};
 use theme::{SIDEBAR_WIDTH, Theme};
 
@@ -141,6 +146,8 @@ pub fn run(connection: UiConnection, shutdown: impl Future<Output = ()> + 'stati
 fn bind_keys(cx: &mut App) {
     use platform::shortcut;
 
+    input::bind_keys(cx);
+    login::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrevious, None),
@@ -159,12 +166,22 @@ struct BookApp {
     screen: Screen,
     focus_handle: FocusHandle,
     sidebar_toggle_focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    queue_focus: FocusHandle,
+    download_scroll: gpui::ScrollHandle,
+    download_controls: std::collections::HashMap<downloads::Control, downloads::ScrollControl>,
+    focus_download: bool,
     sidebar_open: bool,
     commands: Sender<CoreCommand>,
     info: Option<AppInfo>,
     records: Vec<DownloadRecord>,
+    transfer: TransferState,
+    metrics: Option<(tgbooks_core::DownloadKey, metrics::DisplayMetrics)>,
     loading: bool,
     notice: Option<&'static str>,
+    authentication: AuthState,
+    login: gpui::Entity<login::LoginForm>,
+    catalog: gpui::Entity<channels::CatalogView>,
     _events: Task<()>,
 }
 
@@ -175,7 +192,7 @@ impl BookApp {
             while let Ok(event) = events.recv().await {
                 if view
                     .update(cx, |view, cx| {
-                        view.apply_event(event);
+                        view.apply_event(event, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -187,47 +204,213 @@ impl BookApp {
                 view.loading = false;
                 view.notice
                     .get_or_insert("Фоновый сервис остановлен. Перезапустите приложение.");
+                if view.authentication.busy || view.authentication.step == AuthStep::Authorized {
+                    view.authentication = AuthState {
+                        error: Some(tgbooks_core::AuthError::Network),
+                        ..Default::default()
+                    };
+                    view.login.update(cx, |form, cx| {
+                        form.set_state(view.authentication.clone(), cx)
+                    });
+                }
+                view.catalog.update(cx, |catalog, cx| {
+                    catalog.set_state(CatalogState::default(), cx);
+                    catalog.set_transfer(TransferState::default(), cx);
+                });
+                view.transfer = TransferState {
+                    error: view
+                        .transfer
+                        .active
+                        .map(|_| tgbooks_core::DownloadError::Network),
+                    ..Default::default()
+                };
+                view.metrics = None;
                 cx.notify();
             });
         });
+        let cancel_focus = cx.focus_handle().tab_stop(true);
+        let queue_focus = cx.focus_handle().tab_stop(true);
+        let download_scroll = gpui::ScrollHandle::new();
+        let download_controls = [
+            (
+                downloads::Control::Active,
+                downloads::ScrollControl::new(cancel_focus.clone(), download_scroll.clone()),
+            ),
+            (
+                downloads::Control::Queue,
+                downloads::ScrollControl::new(queue_focus.clone(), download_scroll.clone()),
+            ),
+        ]
+        .into();
         Self {
             screen: Screen::default(),
             focus_handle: cx.focus_handle(),
             sidebar_toggle_focus: cx.focus_handle().tab_stop(true),
+            cancel_focus,
+            queue_focus,
+            download_scroll,
+            download_controls,
+            focus_download: false,
             sidebar_open: true,
-            commands: connection.commands,
+            commands: connection.commands.clone(),
             info: None,
             records: Vec::new(),
+            transfer: TransferState::default(),
+            metrics: None,
             loading: true,
             notice: None,
+            authentication: AuthState {
+                busy: true,
+                ..Default::default()
+            },
+            login: cx.new(|cx| login::LoginForm::new(connection.commands.clone(), cx)),
+            catalog: cx.new(|cx| channels::CatalogView::new(connection.commands, cx)),
             _events: task,
         }
     }
 
-    fn apply_event(&mut self, event: CoreEvent) {
+    fn apply_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
             CoreEvent::Ready(info) => self.info = Some(info),
             CoreEvent::HistoryLoaded(records) => {
                 self.records = records;
+                self.sync_download_controls(cx);
                 self.loading = false;
                 self.notice = None;
             }
+            CoreEvent::Authentication(state) => {
+                if state.step == AuthStep::Authorized
+                    && self.authentication.step != AuthStep::Authorized
+                {
+                    self.navigate(Screen::Channels, cx);
+                } else if state.step != AuthStep::Authorized {
+                    self.catalog.update(cx, |catalog, cx| {
+                        catalog.set_state(CatalogState::default(), cx)
+                    });
+                }
+                self.login
+                    .update(cx, |form, cx| form.set_state(state.clone(), cx));
+                self.authentication = state;
+            }
+            CoreEvent::Catalog(state) => self
+                .catalog
+                .update(cx, |catalog, cx| catalog.set_state(state, cx)),
+            CoreEvent::DownloadState(state) => {
+                if state.active != self.transfer.active || state.cancelling {
+                    self.metrics = None;
+                }
+                let first_job = self.transfer.active.is_none()
+                    && self.transfer.queued.is_empty()
+                    && (state.active.is_some() || !state.queued.is_empty());
+                let new_error = state.error.is_some()
+                    && (state.error != self.transfer.error
+                        || state.error_file != self.transfer.error_file);
+                if first_job || new_error {
+                    self.navigate(Screen::Downloads, cx);
+                    self.focus_download = first_job;
+                }
+                self.catalog
+                    .update(cx, |catalog, cx| catalog.set_transfer(state.clone(), cx));
+                self.transfer = state;
+                self.sync_download_controls(cx);
+            }
+            CoreEvent::DownloadUpdated(record) => {
+                let completed = record.status == DownloadStatus::Completed;
+                if record.status != DownloadStatus::Downloading
+                    && self.metrics.is_some_and(|(key, _)| key == record.key)
+                {
+                    self.metrics = None;
+                }
+                if let Some(existing) = self
+                    .records
+                    .iter_mut()
+                    .find(|existing| existing.key == record.key)
+                {
+                    *existing = record;
+                } else {
+                    self.records.insert(0, record);
+                }
+                if completed {
+                    self.sync_download_controls(cx);
+                }
+            }
+            CoreEvent::DownloadMetrics { key, metrics } => {
+                if self.transfer.active == Some(key)
+                    && !self.transfer.cancelling
+                    && self.records.iter().any(|record| {
+                        record.key == key && record.status == DownloadStatus::Downloading
+                    })
+                {
+                    self.metrics
+                        .get_or_insert((key, metrics::DisplayMetrics::default()))
+                        .1
+                        .update(metrics, std::time::Instant::now());
+                }
+            }
             CoreEvent::Failed(failure) => {
                 self.loading = false;
+                if matches!(
+                    failure,
+                    ServiceFailure::Initialization | ServiceFailure::AlreadyRunning
+                ) {
+                    self.authentication = AuthState {
+                        error: Some(if failure == ServiceFailure::AlreadyRunning {
+                            tgbooks_core::AuthError::AlreadyRunning
+                        } else {
+                            tgbooks_core::AuthError::SecureStorage
+                        }),
+                        ..Default::default()
+                    };
+                    self.login.update(cx, |form, cx| {
+                        form.set_state(self.authentication.clone(), cx)
+                    });
+                }
                 self.notice = Some(match failure {
                     ServiceFailure::Initialization => {
                         "Не удалось открыть локальные данные. Проверьте права доступа к директории приложения."
                     }
+                    ServiceFailure::AlreadyRunning => {
+                        "Этот каталог данных уже используется. Закройте другой экземпляр Telegram Books и перезапустите приложение."
+                    }
                     ServiceFailure::Storage => {
-                        "Не удалось прочитать историю. Проверьте доступ к SQLite и повторите обновление."
+                        "Не удалось прочитать или обновить историю. Проверьте доступ к SQLite и повторите обновление."
                     }
                 });
             }
         }
     }
 
+    fn sync_download_controls(&mut self, cx: &mut Context<Self>) {
+        use downloads::{Control, ScrollControl};
+        let mut wanted = std::collections::HashSet::from([Control::Active, Control::Queue]);
+        wanted.extend(
+            self.transfer
+                .queued
+                .iter()
+                .map(|job| Control::Waiting(job.book.key)),
+        );
+        wanted.extend(
+            self.records
+                .iter()
+                .filter(|record| record.status == DownloadStatus::Completed)
+                .map(|record| Control::Reveal(record.key)),
+        );
+        self.download_controls.retain(|id, _| wanted.contains(id));
+        for id in wanted {
+            self.download_controls.entry(id).or_insert_with(|| {
+                ScrollControl::new(
+                    cx.focus_handle().tab_stop(true),
+                    self.download_scroll.clone(),
+                )
+            });
+        }
+    }
+
     fn navigate(&mut self, screen: Screen, cx: &mut Context<Self>) {
         self.screen = screen;
+        if screen != Screen::Downloads {
+            self.focus_download = false;
+        }
         cx.notify();
     }
 
@@ -258,6 +441,11 @@ impl BookApp {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.screen == Screen::Channels {
+            self.catalog.update(cx, |catalog, cx| catalog.refresh(cx));
+            cx.notify();
+            return;
+        }
         if !self.loading && !self.commands.is_closed() {
             match self.commands.try_send(CoreCommand::RefreshHistory) {
                 Ok(()) => {
@@ -270,8 +458,60 @@ impl BookApp {
         }
     }
 
+    fn cancel_download(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.transfer.active
+            && !self.transfer.cancelling
+        {
+            if self
+                .commands
+                .try_send(CoreCommand::CancelDownload(key))
+                .is_ok()
+            {
+                self.transfer.cancelling = true;
+            } else {
+                self.notice = Some("Не удалось отменить загрузку. Повторите действие.");
+            }
+            cx.notify();
+        }
+    }
+
+    fn cancel_queued(
+        &mut self,
+        key: tgbooks_core::DownloadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .commands
+            .try_send(CoreCommand::CancelDownload(key))
+            .is_err()
+        {
+            self.notice = Some("Не удалось убрать задание из очереди. Повторите действие.");
+        }
+        // The row's button will disappear after acknowledgement.
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_queue(&mut self, cx: &mut Context<Self>) {
+        if self
+            .commands
+            .try_send(CoreCommand::SetQueuePaused(!self.transfer.paused))
+            .is_err()
+        {
+            self.notice = Some("Не удалось изменить состояние очереди. Повторите действие.");
+        }
+        cx.notify();
+    }
+
     fn refresh_control(&self, cx: &Context<Self>) -> AnyElement {
-        if self.loading || self.commands.is_closed() {
+        let loading = if self.screen == Screen::Channels {
+            self.catalog.read(cx).busy()
+        } else {
+            self.loading
+        };
+        let transferring = self.screen == Screen::Channels && self.transfer.active.is_some();
+        if loading || transferring || self.commands.is_closed() {
             // This GPUI revision has no public disabled-button accessibility API.
             // Use non-interactive status text rather than a misleading fake button.
             return div()
@@ -279,14 +519,19 @@ impl BookApp {
                 .py_1()
                 .text_sm()
                 .text_color(Theme::dark().muted)
-                .child(if self.loading {
-                    "Обновление…"
-                } else {
+                .child(if self.commands.is_closed() {
                     "Сервис остановлен"
+                } else if transferring {
+                    "Идёт загрузка…"
+                } else {
+                    "Обновление…"
                 })
                 .into_any_element();
         }
-        button("refresh-history", "Обновить")
+        if self.screen == Screen::Channels && self.authentication.step != AuthStep::Authorized {
+            return div().into_any_element();
+        }
+        button("refresh", "Обновить")
             .text_sm()
             .on_click(cx.listener(|view, _, _, cx| view.refresh(cx)))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
@@ -350,27 +595,30 @@ impl BookApp {
                     .text_sm()
                     .child("Telegram Books")
                     .text_color(theme.muted)
-                    .child("Telegram не подключён"),
+                    .child(if self.authentication.busy {
+                        "Проверяем Telegram…"
+                    } else if self.authentication.step == AuthStep::Authorized {
+                        "Telegram подключён"
+                    } else {
+                        "Telegram не подключён"
+                    }),
             )
     }
 
-    fn content(&self) -> Div {
+    fn content(&self, cx: &Context<Self>) -> Div {
         match self.screen {
-            Screen::Login => empty_state(
-                "Подключите Telegram",
-                "Вход по номеру телефона, коду и 2FA появится в следующей итерации. Пока доступны навигация и локальная история загрузок.",
-            ),
-            Screen::Channels => empty_state(
-                "Каналы появятся после входа",
-                "В следующей итерации здесь будут доступны публичные и приватные каналы, участником которых является ваш аккаунт.",
-            ),
-            Screen::Downloads | Screen::Library => self.downloads(),
+            Screen::Login => div().h_full().min_h_0().child(self.login.clone()),
+            Screen::Channels => div().h_full().min_h_0().child(self.catalog.clone()),
+            Screen::Downloads | Screen::Library => downloads::render(self, cx),
             Screen::Settings => {
                 let mut settings = div().flex().flex_col();
                 if let Some(info) = &self.info {
                     settings = settings
                         .child(setting("Директория данных", info.data_directory.clone()))
-                        .child(setting("Директория книг", info.download_directory.clone()));
+                        .child(setting(
+                            "Рабочая директория книг",
+                            info.download_directory.clone(),
+                        ));
                 }
                 settings
                     .child(setting(
@@ -384,62 +632,10 @@ impl BookApp {
                         div()
                             .pt_6()
                             .text_color(Theme::dark().muted)
-                            .child("Параметры пока доступны только для просмотра. Выбор директории будет добавлен вместе со скачиванием."),
+                            .child("Папка сохранения выбирается для каждой добавляемой группы книг. Очередь скачивает по одному файлу. Фактический путь остаётся в истории; эти параметры пока доступны только для просмотра."),
                     )
             }
         }
-    }
-
-    fn downloads(&self) -> Div {
-        let records: Vec<_> = self
-            .records
-            .iter()
-            .filter(|record| {
-                self.screen != Screen::Library || record.status == DownloadStatus::Completed
-            })
-            .collect();
-        if records.is_empty() {
-            return empty_state(
-                if self.loading {
-                    "Читаем локальную историю…"
-                } else if self.screen == Screen::Library {
-                    "Библиотека пока пуста"
-                } else {
-                    "Загрузок пока нет"
-                },
-                "Здесь отображается реальная история из SQLite. Скачивание из Telegram ещё не подключено; демонстрационные записи не создаются.",
-            );
-        }
-        let theme = Theme::dark();
-        div()
-            .flex()
-            .flex_col()
-            .children(records.into_iter().map(|record| {
-                let progress = match record.progress.percentage() {
-                    Some(percent) => format!("{percent}%"),
-                    None => format!("{} байт", record.progress.downloaded_bytes()),
-                };
-                let status = match record.status {
-                    DownloadStatus::Queued => "В очереди",
-                    DownloadStatus::Downloading => "Скачивается",
-                    DownloadStatus::Completed => "Скачано",
-                    DownloadStatus::Failed => "Ошибка",
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .py_4()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(record.file_name.clone())
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted)
-                            .child(format!("{status}: {progress}")),
-                    )
-            }))
     }
 }
 
@@ -448,7 +644,25 @@ fn is_activation_key(event: &KeyDownEvent) -> bool {
 }
 
 impl Render for BookApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for control in self.download_controls.values_mut() {
+            control.observe(window, cx);
+        }
+        if self.screen == Screen::Downloads {
+            if self.focus_download && self.transfer.active.is_some() && !self.transfer.cancelling {
+                self.cancel_focus.focus(window, cx);
+            } else if (self.transfer.active.is_none() || self.transfer.cancelling)
+                && self.cancel_focus.is_focused(window)
+            {
+                self.focus_handle.focus(window, cx);
+            }
+            if self.transfer.queued.is_empty() && self.queue_focus.is_focused(window) {
+                self.focus_handle.focus(window, cx);
+            }
+        }
+        if self.transfer.active.is_some() || self.transfer.queued.is_empty() {
+            self.focus_download = false;
+        }
         let theme = Theme::dark();
         div()
             .id("application")
@@ -490,7 +704,7 @@ impl Render for BookApp {
                             .min_w_0()
                             .h_full()
                             .p_6()
-                            .gap_6()
+                            .gap_4()
                             .child(
                                 div()
                                     .flex()
@@ -528,7 +742,11 @@ impl Render for BookApp {
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
-                                    .child(self.content()),
+                                    .when(
+                                        matches!(self.screen, Screen::Downloads | Screen::Library),
+                                        |content| content.track_scroll(&self.download_scroll),
+                                    )
+                                    .child(self.content(cx)),
                             )
                             .child(
                                 div()
@@ -566,14 +784,446 @@ mod tests {
         let app = cx.new(|cx| BookApp::new(ui, cx));
         app.update(cx, |app, cx| {
             app.navigate(Screen::Library, cx);
-            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()));
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
             app.refresh(cx);
         });
         app.read_with(cx, |app, _| {
             assert_eq!(app.screen, Screen::Library);
             assert!(app.loading);
         });
-        assert_eq!(backend.commands.try_recv(), Ok(CoreCommand::RefreshHistory));
+        assert!(matches!(
+            backend.commands.try_recv(),
+            Ok(CoreCommand::RefreshHistory)
+        ));
+    }
+
+    #[gpui::test]
+    fn authorized_login_opens_channels_and_refresh_targets_the_catalog(cx: &mut TestAppContext) {
+        let (ui, backend) = tgbooks_core::connect();
+        let app = cx.new(|cx| BookApp::new(ui, cx));
+        app.update(cx, |app, cx| {
+            app.apply_event(
+                CoreEvent::Authentication(AuthState {
+                    step: AuthStep::Authorized,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(
+                CoreEvent::Catalog(CatalogState {
+                    authenticated: true,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.refresh(cx);
+            app.refresh(cx);
+            assert_eq!(app.screen, Screen::Channels);
+        });
+        assert!(matches!(
+            backend.commands.try_recv(),
+            Ok(CoreCommand::RefreshChannels)
+        ));
+        assert!(backend.commands.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    fn download_progress_updates_one_record_and_keyboard_can_cancel(cx: &mut TestAppContext) {
+        use tgbooks_core::{DownloadKey, DownloadProgress, DownloadStatus};
+
+        let (ui, backend) = tgbooks_core::connect();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            bind_keys(cx);
+            let app = BookApp::new(ui, cx);
+            app.focus_handle.focus(window, cx);
+            app
+        });
+        let key = DownloadKey {
+            channel_id: -1000000000001,
+            message_id: 7,
+            document_id: 8,
+        };
+        app.update(&mut cx.cx, |app, cx| {
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            for bytes in [0, 40] {
+                let Ok(progress) = DownloadProgress::new(bytes, Some(100)) else {
+                    panic!("invalid test progress")
+                };
+                app.apply_event(
+                    CoreEvent::DownloadUpdated(DownloadRecord {
+                        key,
+                        file_name: "book.epub".into(),
+                        local_path: "books/book.epub".into(),
+                        status: DownloadStatus::Downloading,
+                        progress,
+                    }),
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.read_with(&cx.cx, |app, _| {
+            assert_eq!(app.screen, Screen::Downloads);
+            assert_eq!(app.records.len(), 1);
+            assert_eq!(app.records[0].progress.percentage(), Some(40));
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(
+            matches!(backend.commands.try_recv(), Ok(CoreCommand::CancelDownload(actual)) if actual == key)
+        );
+        app.read_with(&cx.cx, |app, _| assert!(app.transfer.cancelling));
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(app.read(cx).focus_handle.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn waiting_queue_supports_keyboard_pause_and_cancel_without_navigation_on_next_file(
+        cx: &mut TestAppContext,
+    ) {
+        use tgbooks_core::{BookAttachment, DownloadKey, QueuedDownload};
+        let (ui, backend) = tgbooks_core::connect();
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            bind_keys(cx);
+            BookApp::new(ui, cx)
+        });
+        let key = DownloadKey {
+            channel_id: -1000000000001,
+            message_id: 7,
+            document_id: 8,
+        };
+        let job = QueuedDownload {
+            book: BookAttachment {
+                key,
+                file_name: "book.epub".into(),
+                size_bytes: Some(10),
+                format: BookFormat::Epub,
+            },
+            directory: std::env::temp_dir(),
+        };
+        app.update(&mut cx.cx, |app, cx| {
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    queued: vec![job.clone()],
+                    paused: true,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.activate_window();
+            app.read(cx).queue_focus.clone().focus(window, cx);
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(matches!(
+            backend.commands.try_recv(),
+            Ok(CoreCommand::SetQueuePaused(false))
+        ));
+        // The next tab target is the waiting row's removal button.
+        cx.simulate_keystrokes("tab enter");
+        assert!(
+            matches!(backend.commands.try_recv(), Ok(CoreCommand::CancelDownload(actual)) if actual == key)
+        );
+        cx.update(|window, cx| assert!(app.read(cx).focus_handle.is_focused(window)));
+        app.update(&mut cx.cx, |app, cx| {
+            app.navigate(Screen::Channels, cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert_eq!(
+                app.screen,
+                Screen::Channels,
+                "starting the next job stole navigation"
+            );
+            assert!(!app.focus_download);
+            app.apply_event(CoreEvent::DownloadState(TransferState::default()), cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn focused_waiting_controls_scroll_into_view_in_a_small_window(cx: &mut TestAppContext) {
+        use tgbooks_core::{BookAttachment, DownloadKey, QueuedDownload};
+        let (ui, _backend) = tgbooks_core::connect();
+        let window = cx.open_window(size(px(760.), px(520.)), |_, cx| BookApp::new(ui, cx));
+        let Ok(app) = window.root(cx) else {
+            panic!("queue window missing")
+        };
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let jobs: Vec<_> = (0..20)
+            .map(|index| QueuedDownload {
+                book: BookAttachment {
+                    key: DownloadKey {
+                        channel_id: -1000000000001,
+                        message_id: index,
+                        document_id: i64::from(index),
+                    },
+                    file_name: format!("Очень длинное название книги 世界 {index}.epub"),
+                    size_bytes: Some(10),
+                    format: BookFormat::Epub,
+                },
+                directory: std::env::temp_dir(),
+            })
+            .collect();
+        app.update(&mut visual.cx, |app, cx| {
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    queued: jobs.clone(),
+                    paused: true,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        visual.run_until_parked();
+        for (index, selector) in [(19, "cancel-queued-19"), (0, "cancel-queued-0")] {
+            let focus = app.read_with(&visual.cx, |app, _| {
+                app.download_controls[&downloads::Control::Waiting(jobs[index].book.key)]
+                    .focus
+                    .clone()
+            });
+            visual.update(|window, cx| {
+                window.activate_window();
+                focus.focus(window, cx);
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                // GPUI's test platform has no native display frame loop.
+                window.simulate_next_frame(cx);
+            });
+            visual.run_until_parked();
+            let Some(bounds) = visual.debug_bounds(selector) else {
+                panic!("queued button was not drawn")
+            };
+            app.read_with(&visual.cx, |app, _| {
+                let viewport = app.download_scroll.bounds();
+                assert!(
+                    bounds.top() >= viewport.top() - px(1.),
+                    "{selector}: {bounds:?}, {viewport:?}, offset {:?}",
+                    app.download_scroll.offset()
+                );
+                assert!(
+                    bounds.bottom() <= viewport.bottom() + px(1.),
+                    "{selector}: {bounds:?}, {viewport:?}, offset {:?}",
+                    app.download_scroll.offset()
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn live_metrics_are_scoped_to_one_attempt_and_never_restored_from_history(
+        cx: &mut TestAppContext,
+    ) {
+        use tgbooks_core::{DownloadKey, DownloadProgress, TransferMetrics};
+        let (ui, _backend) = tgbooks_core::connect();
+        let app = cx.new(|cx| BookApp::new(ui, cx));
+        let key = DownloadKey {
+            channel_id: -1000000000001,
+            message_id: 1,
+            document_id: 2,
+        };
+        let another = DownloadKey {
+            message_id: 2,
+            ..key
+        };
+        let metrics = TransferMetrics {
+            bytes_per_second: Some(20),
+            remaining_seconds: Some(3),
+        };
+        let Ok(progress) = DownloadProgress::new(40, Some(100)) else {
+            panic!("invalid test progress")
+        };
+        let mut record = DownloadRecord {
+            key,
+            file_name: "books.zip".into(),
+            local_path: "books.zip".into(),
+            status: DownloadStatus::Downloading,
+            progress,
+        };
+        app.update(cx, |app, cx| {
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::DownloadUpdated(record.clone()), cx);
+            app.apply_event(
+                CoreEvent::DownloadMetrics {
+                    key,
+                    metrics: TransferMetrics {
+                        bytes_per_second: Some(0),
+                        remaining_seconds: None,
+                    },
+                },
+                cx,
+            );
+            assert_eq!(
+                app.metrics
+                    .and_then(|(_, display)| display.values.bytes_per_second),
+                None
+            );
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+            assert_eq!(
+                app.metrics.map(|(key, display)| (key, display.values)),
+                Some((key, metrics))
+            );
+            app.apply_event(
+                CoreEvent::DownloadMetrics {
+                    key: another,
+                    metrics: TransferMetrics::default(),
+                },
+                cx,
+            );
+            assert_eq!(
+                app.metrics.map(|(key, display)| (key, display.values)),
+                Some((key, metrics))
+            );
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    cancelling: true,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+            assert_eq!(app.metrics, None);
+            // Another attempt must measure again even when its key is unchanged.
+            app.apply_event(CoreEvent::DownloadState(TransferState::default()), cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::HistoryLoaded(vec![record.clone()]), cx);
+            assert_eq!(app.metrics, None);
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+            record.status = DownloadStatus::Completed;
+            let Ok(progress) = DownloadProgress::new(100, Some(100)) else {
+                panic!("invalid test progress")
+            };
+            record.progress = progress;
+            app.apply_event(CoreEvent::DownloadUpdated(record), cx);
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+            assert_eq!(
+                app.metrics, None,
+                "late metrics revived a completed transfer"
+            );
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(another),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+            assert_eq!(app.metrics, None);
+        });
+    }
+
+    #[gpui::test]
+    fn metric_column_stays_right_aligned_and_stable_in_a_compact_window(cx: &mut TestAppContext) {
+        use tgbooks_core::{DownloadKey, DownloadProgress, TransferMetrics};
+        let (ui, _backend) = tgbooks_core::connect();
+        let window = cx.open_window(size(px(760.), px(520.)), |_, cx| BookApp::new(ui, cx));
+        let Ok(app) = window.root(cx) else {
+            panic!("download window missing")
+        };
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let key = DownloadKey {
+            channel_id: -1000000000001,
+            message_id: 1,
+            document_id: 2,
+        };
+        let Ok(progress) = DownloadProgress::new(100_000_000, Some(1_400_000_000)) else {
+            panic!("invalid test progress")
+        };
+        let record = DownloadRecord {
+            key,
+            file_name: "Полное собрание книг с очень длинным названием 世界.zip".into(),
+            local_path: "books.zip".into(),
+            status: DownloadStatus::Downloading,
+            progress,
+        };
+        let metrics = TransferMetrics {
+            bytes_per_second: Some(409_600),
+            remaining_seconds: Some(2760),
+        };
+        app.update(&mut visual.cx, |app, cx| {
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(key),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::DownloadUpdated(record), cx);
+            app.apply_event(CoreEvent::DownloadMetrics { key, metrics }, cx);
+        });
+        visual.run_until_parked();
+        let Some(speed) = visual.debug_bounds("download-speed") else {
+            panic!("speed missing")
+        };
+        let Some(eta) = visual.debug_bounds("download-eta") else {
+            panic!("ETA missing")
+        };
+        assert_eq!(speed.right(), eta.right());
+        assert!(eta.top() >= speed.bottom());
+        app.read_with(&visual.cx, |app, _| {
+            assert!((speed.right() - app.download_scroll.bounds().right()).abs() <= px(1.));
+        });
+        app.update(&mut visual.cx, |app, cx| {
+            // Fast incoming updates must not change the visible sample.
+            app.apply_event(
+                CoreEvent::DownloadMetrics {
+                    key,
+                    metrics: TransferMetrics {
+                        bytes_per_second: Some(999_999),
+                        remaining_seconds: Some(9999),
+                    },
+                },
+                cx,
+            );
+            assert_eq!(
+                app.metrics.map(|(_, display)| display.values),
+                Some(metrics)
+            );
+            // Simulate both presentation periods expiring without a real sleep.
+            if let Some((_, display)) = app.metrics.as_mut() {
+                display.update(
+                    TransferMetrics {
+                        bytes_per_second: Some(u64::MAX),
+                        remaining_seconds: Some(u64::MAX),
+                    },
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                );
+            }
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("download-speed"), Some(speed));
+        assert_eq!(visual.debug_bounds("download-eta"), Some(eta));
     }
 
     #[gpui::test]
@@ -648,6 +1298,87 @@ mod tests {
         app.read_with(&cx.cx, |app, _| assert!(app.sidebar_open));
         cx.simulate_keystrokes("tab enter");
         app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Login));
+    }
+
+    #[gpui::test]
+    fn native_text_input_tab_and_enter_drive_every_authentication_step(cx: &mut TestAppContext) {
+        use tgbooks_core::AuthAction;
+
+        let (ui, backend) = tgbooks_core::connect();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            bind_keys(cx);
+            let app = BookApp::new(ui, cx);
+            app.focus_handle.focus(window, cx);
+            app
+        });
+        app.update(&mut cx.cx, |app, cx| {
+            app.apply_event(CoreEvent::Authentication(AuthState::default()), cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_input("1");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input(&"0".repeat(32));
+        cx.simulate_keystrokes("enter");
+        let Ok(CoreCommand::Authenticate(AuthAction::Configure { api_id, api_hash })) =
+            backend.commands.try_recv()
+        else {
+            panic!("credentials were not sent from native fields")
+        };
+        assert_eq!(api_id, 1);
+        assert_eq!(api_hash.expose(), "0".repeat(32));
+        for (step, value) in [
+            (AuthStep::Phone, "+15551234567"),
+            (AuthStep::Code, "12345"),
+            (AuthStep::Password, "dummy password"),
+        ] {
+            app.update(&mut cx.cx, |app, cx| {
+                app.apply_event(
+                    CoreEvent::Authentication(AuthState {
+                        step,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            cx.simulate_input(value);
+            cx.simulate_keystrokes("enter");
+            let Ok(CoreCommand::Authenticate(action)) = backend.commands.try_recv() else {
+                panic!("authentication command was not sent")
+            };
+            let secret = match action {
+                AuthAction::RequestCode(value)
+                | AuthAction::SubmitCode(value)
+                | AuthAction::SubmitPassword(value) => value,
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(secret.expose(), value);
+        }
+    }
+
+    #[gpui::test]
+    fn second_instance_error_is_not_replaced_by_a_network_error(cx: &mut TestAppContext) {
+        let (ui, backend) = tgbooks_core::connect();
+        let app = cx.new(|cx| BookApp::new(ui, cx));
+        assert!(
+            backend
+                .events
+                .try_send(CoreEvent::Failed(ServiceFailure::AlreadyRunning))
+                .is_ok()
+        );
+        drop(backend);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.authentication.error,
+                Some(tgbooks_core::AuthError::AlreadyRunning)
+            );
+            assert!(!app.authentication.busy);
+            assert!(
+                app.notice
+                    .is_some_and(|notice| notice.contains("другой экземпляр"))
+            );
+        });
     }
 
     #[gpui::test]

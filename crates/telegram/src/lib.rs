@@ -1,7 +1,15 @@
 //! Grammers 0.11 transport boundary.
 //!
-//! Authentication and a secure persistent Session adapter are not implemented yet.
-//! The application shell does not create a connection or read credentials.
+//! Authentication and write-through encrypted sessions. Raw MTProto types never
+//! cross the Core/UI boundary.
+
+mod auth;
+mod channels;
+mod download;
+mod session;
+mod vault;
+
+pub use auth::TelegramAuth;
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -9,10 +17,11 @@ use grammers_client::{Client, InvocationError, SenderPool};
 use grammers_session::Session;
 use thiserror::Error;
 use tokio::{runtime::Handle, task::JoinHandle};
+use zeroize::Zeroizing;
 
 pub struct ApiCredentials {
     api_id: i32,
-    api_hash: String,
+    api_hash: Zeroizing<String>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -24,7 +33,10 @@ impl ApiCredentials {
         if api_id <= 0 || api_hash.len() != 32 || !api_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(InvalidCredentials);
         }
-        Ok(Self { api_id, api_hash })
+        Ok(Self {
+            api_id,
+            api_hash: Zeroizing::new(api_hash),
+        })
     }
 
     pub fn api_hash(&self) -> &str {
@@ -45,7 +57,7 @@ impl fmt::Debug for ApiCredentials {
 /// A session is injected: MemorySession is suitable only for offline tests.
 pub struct TelegramConnection {
     client: Client,
-    runner: JoinHandle<()>,
+    runner: Option<JoinHandle<()>>,
 }
 
 impl TelegramConnection {
@@ -54,22 +66,42 @@ impl TelegramConnection {
         S: Session,
         S::Error: Error + Send + Sync + 'static,
     {
-        let SenderPool { runner, handle, .. } = SenderPool::new(session, credentials.api_id);
+        let SenderPool { runner, handle, .. } = SenderPool::with_configuration(
+            session,
+            credentials.api_id,
+            grammers_client::sender::ConnectionParams {
+                device_model: "Telegram Books desktop".into(),
+                system_version: std::env::consts::OS.into(),
+                app_version: env!("CARGO_PKG_VERSION").into(),
+                retry_policy: Box::new(grammers_client::sender::NoRetries),
+                ..Default::default()
+            },
+        );
         Self {
             client: Client::new(handle),
-            runner: runtime.spawn(runner.run()),
+            runner: Some(runtime.spawn(runner.run())),
         }
     }
 
     pub async fn is_authorized(&self) -> Result<bool, InvocationError> {
         self.client.is_authorized().await
     }
+
+    async fn stop(&mut self) {
+        self.client.disconnect();
+        if let Some(runner) = self.runner.take() {
+            runner.abort();
+            let _ = runner.await;
+        }
+    }
 }
 
 impl Drop for TelegramConnection {
     fn drop(&mut self) {
         self.client.disconnect();
-        self.runner.abort();
+        if let Some(runner) = &self.runner {
+            runner.abort();
+        }
     }
 }
 

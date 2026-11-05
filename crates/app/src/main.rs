@@ -46,11 +46,13 @@ fn run() -> Result<()> {
         .context("could not start the background runtime")?;
     let (ui_connection, service_connection) = tgbooks_core::connect();
     let commands = ui_connection.commands.clone();
+    let cancellation = ui_connection.shutdown.clone();
     let backend = runtime.spawn(backend::run(service_connection));
 
     // AppKit can terminate the process without returning from the event loop.
     // Await cleanup inside GPUI's quit hook, not only after ui::run returns.
     let shutdown = async move {
+        cancellation.cancel();
         commands.close();
         if backend.await.is_err() {
             tracing::error!("background service terminated unexpectedly");

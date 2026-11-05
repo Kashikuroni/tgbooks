@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use tgbooks_core::{AppInfo, CoreEvent, ServiceConnection, ServiceFailure, run_service};
-use tgbooks_storage::{AppPaths, Storage};
+use tgbooks_downloader::LocalDownloader;
+use tgbooks_storage::{AppLock, AppLockError, AppPaths, Storage};
+use tgbooks_telegram::TelegramAuth;
 
 pub async fn run(connection: ServiceConnection) {
     let initialized = async {
@@ -12,23 +14,39 @@ pub async fn run(connection: ServiceConnection) {
             Some(path) => AppPaths::in_directory(PathBuf::from(path))?,
             None => AppPaths::discover()?,
         };
-        initialize(paths).await
+        let directory = paths.data_directory().to_owned();
+        paths.prepare().await?;
+        let lock = AppLock::acquire(&directory).await?;
+        let (storage, info) = initialize(paths).await?;
+        Ok::<_, anyhow::Error>((storage, info, TelegramAuth::new(directory), lock))
     }
     .await;
 
     match initialized {
-        Ok((storage, info)) => {
+        Ok((storage, info, authentication, _lock)) => {
             tracing::info!("local backend ready");
-            run_service(&storage, info, connection).await;
+            run_service(
+                &storage,
+                authentication,
+                LocalDownloader::new(storage.clone()),
+                info,
+                connection,
+            )
+            .await;
             storage.close().await;
             tracing::info!("local backend stopped");
         }
         Err(error) => {
             tracing::error!(error = %error, "local backend initialization failed");
-            let _ = connection
-                .events
-                .send(CoreEvent::Failed(ServiceFailure::Initialization))
-                .await;
+            let failure = if matches!(
+                error.downcast_ref::<AppLockError>(),
+                Some(AppLockError::AlreadyRunning)
+            ) {
+                ServiceFailure::AlreadyRunning
+            } else {
+                ServiceFailure::Initialization
+            };
+            let _ = connection.events.send(CoreEvent::Failed(failure)).await;
         }
     }
 }
@@ -49,12 +67,44 @@ async fn initialize(paths: AppPaths) -> Result<(Storage, AppInfo)> {
 }
 
 #[cfg(test)]
+#[path = "backend_download_tests.rs"]
+mod download_tests;
+
+#[cfg(test)]
 mod tests {
     use tgbooks_core::{
         CoreCommand, DownloadKey, DownloadProgress, DownloadRecord, DownloadStatus,
     };
 
     use super::*;
+
+    struct RestoredAuth;
+
+    impl tgbooks_core::BookSource for RestoredAuth {}
+
+    impl tgbooks_core::Authentication for RestoredAuth {
+        async fn execute(
+            &mut self,
+            _: tgbooks_core::AuthAction,
+        ) -> Result<tgbooks_core::AuthStep, tgbooks_core::AuthFailure> {
+            Ok(tgbooks_core::AuthStep::Authorized)
+        }
+    }
+
+    impl tgbooks_core::ChannelCatalog for RestoredAuth {
+        async fn list_channels(
+            &mut self,
+        ) -> Result<Vec<tgbooks_core::ChannelSummary>, tgbooks_core::CatalogError> {
+            Ok(Vec::new())
+        }
+        async fn scan_books(
+            &mut self,
+            _: i64,
+            _: Option<i32>,
+        ) -> Result<tgbooks_core::BookPage, tgbooks_core::CatalogError> {
+            Err(tgbooks_core::CatalogError::Unavailable)
+        }
+    }
 
     #[tokio::test]
     async fn sqlite_history_reaches_the_ui_protocol_after_restart() -> Result<()> {
@@ -82,7 +132,14 @@ mod tests {
         let (storage, info) = initialize(paths).await?;
         let (ui, backend) = tgbooks_core::connect();
         let task = tokio::spawn(async move {
-            run_service(&storage, info, backend).await;
+            run_service(
+                &storage,
+                RestoredAuth,
+                LocalDownloader::new(storage.clone()),
+                info,
+                backend,
+            )
+            .await;
             storage.close().await;
         });
         assert!(matches!(ui.events.recv().await?, CoreEvent::Ready(_)));
@@ -90,6 +147,33 @@ mod tests {
             ui.events.recv().await?,
             CoreEvent::HistoryLoaded(vec![record.clone()])
         );
+        assert!(matches!(
+            ui.events.recv().await?,
+            CoreEvent::Authentication(tgbooks_core::AuthState { busy: true, .. })
+        ));
+        assert!(matches!(
+            ui.events.recv().await?,
+            CoreEvent::Authentication(tgbooks_core::AuthState {
+                step: tgbooks_core::AuthStep::Authorized,
+                busy: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ui.events.recv().await?,
+            CoreEvent::Catalog(tgbooks_core::CatalogState {
+                operation: Some(tgbooks_core::CatalogOperation::ListChannels),
+                ..
+            })
+        ));
+        assert!(matches!(
+            ui.events.recv().await?,
+            CoreEvent::Catalog(tgbooks_core::CatalogState {
+                authenticated: true,
+                operation: None,
+                ..
+            })
+        ));
         ui.commands.send(CoreCommand::RefreshHistory).await?;
         assert_eq!(
             ui.events.recv().await?,

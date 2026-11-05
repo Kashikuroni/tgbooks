@@ -10,7 +10,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+tgbooks-core.workspace = true
+chacha20poly1305.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
 grammers-client.workspace = true
 grammers-session.workspace = true
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+zeroize.workspace = true

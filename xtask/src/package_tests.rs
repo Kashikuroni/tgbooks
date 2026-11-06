@@ -82,6 +82,20 @@ fn release_and_packager_commands_preserve_arguments_with_spaces() -> Result<()> 
 }
 
 #[test]
+fn macos_architecture_check_puts_input_before_the_variadic_architecture_list() {
+    let binary = Path::new("/package with spaces/Telegram Books.app/Contents/MacOS/tgbooks");
+    let command = macos_architecture_command(binary);
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            binary.as_os_str(),
+            OsStr::new("-verify_arch"),
+            OsStr::new("arm64")
+        ]
+    );
+}
+
+#[test]
 fn metadata_keeps_identity_and_derives_version_from_cargo() -> Result<()> {
     let manifest = manifest()?;
     let config = &manifest["package"]["metadata"]["packager"];

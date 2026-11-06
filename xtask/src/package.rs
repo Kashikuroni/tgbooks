@@ -320,6 +320,15 @@ fn generate_notices(root: &Path, platform: Platform) -> Result<()> {
     Ok(())
 }
 
+fn macos_architecture_command(binary: &Path) -> Command {
+    let mut command = Command::new("/usr/bin/lipo");
+    // -verify_arch consumes a list of architectures in Xcode 16. Put the input
+    // first so it cannot be parsed as another architecture (Xcode 27 tolerates
+    // the old order, which hid this incompatibility in local validation).
+    command.arg(binary).args(["-verify_arch", "arm64"]);
+    command
+}
+
 pub(crate) fn package(root: &Path) -> Result<()> {
     let platform = Platform::for_host(std::env::consts::OS, std::env::consts::ARCH)?;
     let tool = check_tool(root)?;
@@ -342,11 +351,9 @@ pub(crate) fn package(root: &Path) -> Result<()> {
         Platform::Macos => {
             let bundle = staging.path().join(format!("{APP_NAME}.app"));
             verify_bundle(&bundle, &version)?;
-            execute(
-                Command::new("/usr/bin/lipo")
-                    .args(["-verify_arch", "arm64"])
-                    .arg(bundle.join("Contents/MacOS/tgbooks")),
-            )?;
+            execute(&mut macos_architecture_command(
+                &bundle.join("Contents/MacOS/tgbooks"),
+            ))?;
             execute(
                 Command::new("/usr/bin/codesign")
                     .args(["--force", "--sign", "-"])

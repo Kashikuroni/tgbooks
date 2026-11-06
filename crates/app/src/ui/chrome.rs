@@ -32,14 +32,22 @@ pub fn drag_region() -> impl IntoElement {
 }
 
 pub fn window_controls() -> Div {
-    let controls = div().flex().h_full().flex_shrink_0();
-    if !cfg!(target_os = "windows") {
-        return controls;
+    if cfg!(target_os = "windows") {
+        caption_controls()
+    } else {
+        div().flex().h_full().flex_shrink_0()
     }
+}
+
+fn caption_controls() -> Div {
+    let controls = div().flex().h_full().flex_shrink_0();
     // These GPUI APIs are platform-neutral. Keep this code type-checked on
     // macOS too, even though only Windows displays the custom caption controls.
     let button = |id, label, icon, area| {
         icon_button(id, label, icon)
+            // Match native caption buttons: Alt+Space / Alt+F4 provide keyboard
+            // access; normal Tab navigation stays in the application content.
+            .tab_stop(false)
             .w(px(46.))
             .h_full()
             .rounded_none()
@@ -96,4 +104,49 @@ pub fn toolbar(toggle: impl IntoElement) -> Div {
         .child(toggle)
         .child(drag_region())
         .child(window_controls())
+}
+
+#[cfg(all(test, feature = "gpui-tests"))]
+mod tests {
+    use super::*;
+    use gpui::{Context, FocusHandle, Render, TestAppContext, VisualTestContext};
+
+    struct TabOrder {
+        before: FocusHandle,
+        after: FocusHandle,
+    }
+
+    impl Render for TabOrder {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(div().id("before-caption").track_focus(&self.before))
+                // Render Windows controls even on macOS to catch focus-order
+                // regressions without calling TestWindow's unsupported minimize.
+                .child(caption_controls())
+                .child(div().id("after-caption").track_focus(&self.after))
+        }
+    }
+
+    #[gpui::test]
+    fn caption_buttons_do_not_intercept_content_tab_navigation(cx: &mut TestAppContext) {
+        let handle = cx.open_window(gpui::size(px(760.), px(520.)), |window, cx| {
+            let view = TabOrder {
+                before: cx.focus_handle().tab_stop(true),
+                after: cx.focus_handle().tab_stop(true),
+            };
+            view.before.focus(window, cx);
+            view
+        });
+        let Ok(view) = handle.root(cx) else {
+            panic!("test window missing");
+        };
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.focus_next(cx);
+            assert!(view.read(cx).after.is_focused(window));
+            window.focus_prev(cx);
+            assert!(view.read(cx).before.is_focused(window));
+        });
+    }
 }

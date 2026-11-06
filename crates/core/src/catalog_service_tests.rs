@@ -26,6 +26,9 @@ struct FakeTelegram {
 impl BookSource for FakeTelegram {}
 
 impl Authentication for FakeTelegram {
+    fn account_id(&self) -> Option<i64> {
+        Some(1)
+    }
     async fn execute(&mut self, _: AuthAction) -> Result<AuthStep, AuthFailure> {
         self.calls.push(Call::Authenticate);
         Ok(self.steps.pop_front().unwrap_or(AuthStep::Phone))
@@ -50,6 +53,22 @@ impl ChannelCatalog for FakeTelegram {
 }
 
 struct EmptyHistory;
+impl SettingsStore for EmptyHistory {}
+impl crate::SourceStore for EmptyHistory {}
+impl crate::RecommendationStore for EmptyHistory {}
+
+impl QueueStore for EmptyHistory {
+    async fn load_queue(&self, _: i64) -> Result<Vec<crate::QueuedDownload>, crate::DownloadError> {
+        Ok(Vec::new())
+    }
+    async fn save_queue(
+        &self,
+        _: i64,
+        _: &[crate::QueuedDownload],
+    ) -> Result<(), crate::DownloadError> {
+        Ok(())
+    }
+}
 
 impl DownloadHistory for EmptyHistory {
     type Error = Infallible;
@@ -108,6 +127,7 @@ async fn restored_login_loads_channels_through_the_actor_before_commands()
     let (ui, backend) = connect();
     let telegram = FakeTelegram {
         steps: [AuthStep::Authorized].into(),
+        pages: [Ok(page(100, Some(90)))].into(),
         ..Default::default()
     };
     let task = tokio::spawn(async {
@@ -116,6 +136,7 @@ async fn restored_login_loads_channels_through_the_actor_before_commands()
             telegram,
             UnusedDownloads,
             AppInfo {
+                settings: AppSettings::new("books".into()),
                 data_directory: "data".into(),
                 download_directory: "books".into(),
             },
@@ -153,6 +174,9 @@ async fn restored_login_loads_channels_through_the_actor_before_commands()
     assert!(state.authenticated);
     assert_eq!(state.channels, channels());
     assert!(!state.busy());
+    assert!(
+        matches!(ui.events.recv().await?, CoreEvent::Recommendations(state) if state.loaded && !state.monitoring)
+    );
     ui.commands
         .send(CoreCommand::SelectChannel(Some(CHANNEL)))
         .await?;
@@ -160,9 +184,102 @@ async fn restored_login_loads_channels_through_the_actor_before_commands()
         panic!("selection missing")
     };
     assert_eq!(state.selected, Some(CHANNEL));
+    assert_eq!(state.operation, Some(CatalogOperation::ScanHistory));
+    let CoreEvent::Catalog(state) = ui.events.recv().await? else {
+        panic!("automatic first page missing")
+    };
+    assert!(!state.busy());
+    assert!(state.scan_started);
+    assert_eq!(state.scanned_messages, 100);
+    assert_eq!(state.books, page(100, Some(90)).books);
     ui.commands.send(CoreCommand::Shutdown).await?;
     task.await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn selection_loads_only_the_first_page_and_same_selection_never_advances_it() {
+    let (events, receiver) = async_channel::unbounded();
+    let mut auth = authorized(FakeTelegram {
+        pages: [Ok(page(100, Some(90))), Ok(page(80, None))].into(),
+        ..Default::default()
+    });
+    let mut catalog = selected();
+    catalog.selected = None;
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL), &events).await);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(CoreEvent::Catalog(CatalogState {
+            selected: Some(CHANNEL),
+            operation: Some(CatalogOperation::ScanHistory),
+            scan_started: false,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(CoreEvent::Catalog(CatalogState {
+            operation: None,
+            scan_started: true,
+            scanned_messages: 100,
+            ..
+        }))
+    ));
+    let first = catalog.clone();
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL), &events).await);
+    assert_eq!(catalog, first);
+    assert_eq!(auth.backend_mut().calls, vec![Call::Scan(CHANNEL, None)]);
+    assert!(scan_next_page(&mut auth, &mut catalog, &events).await);
+    assert_eq!(catalog.scanned_messages, 200);
+    assert_eq!(
+        auth.backend_mut().calls,
+        vec![Call::Scan(CHANNEL, None), Call::Scan(CHANNEL, Some(90))]
+    );
+    assert!(select_channel(&mut auth, &mut catalog, None, &events).await);
+    assert!(catalog.books.is_empty());
+    assert_eq!(auth.backend_mut().calls.len(), 2);
+}
+
+#[tokio::test]
+async fn changing_sources_starts_at_newest_messages_and_errors_remain_retryable() {
+    let (events, _receiver) = async_channel::unbounded();
+    let other = CHANNEL - 1;
+    let mut other_page = page(200, None);
+    other_page.books[0].key.channel_id = other;
+    let mut auth = authorized(FakeTelegram {
+        pages: [
+            Err(CatalogError::Network),
+            Ok(page(100, Some(90))),
+            Ok(other_page),
+        ]
+        .into(),
+        ..Default::default()
+    });
+    let mut catalog = selected();
+    catalog.selected = None;
+    catalog.channels.push(ChannelSummary {
+        id: other,
+        title: "Другой канал".into(),
+        username: None,
+        protected: false,
+    });
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL), &events).await);
+    assert_eq!(catalog.error, Some(CatalogError::Network));
+    assert!(!catalog.busy());
+    assert!(!catalog.scan_started);
+    assert!(scan_next_page(&mut auth, &mut catalog, &events).await);
+    assert!(select_channel(&mut auth, &mut catalog, Some(other), &events).await);
+    assert_eq!(catalog.scanned_messages, 100);
+    assert_eq!(catalog.books.len(), 1);
+    assert_eq!(catalog.books[0].key.channel_id, other);
+    assert_eq!(
+        auth.backend_mut().calls,
+        vec![
+            Call::Scan(CHANNEL, None),
+            Call::Scan(CHANNEL, None),
+            Call::Scan(other, None)
+        ]
+    );
 }
 
 #[tokio::test]
@@ -170,6 +287,7 @@ async fn no_catalog_rpc_before_login_or_for_protected_channels() {
     let (events, _receiver) = async_channel::unbounded();
     let mut auth = AuthController::new(FakeTelegram::default());
     let mut catalog = CatalogState::default();
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL), &events).await);
     assert!(refresh_channels(&mut auth, &mut catalog, &events).await);
     assert!(scan_next_page(&mut auth, &mut catalog, &events).await);
     assert_eq!(catalog.error, Some(CatalogError::Unauthorized));
@@ -177,9 +295,14 @@ async fn no_catalog_rpc_before_login_or_for_protected_channels() {
 
     auth.complete(Ok(AuthStep::Authorized));
     catalog = selected();
+    catalog.selected = None;
     catalog.channels[0].protected = true;
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL), &events).await);
     assert!(scan_next_page(&mut auth, &mut catalog, &events).await);
     assert_eq!(catalog.error, Some(CatalogError::ProtectedContent));
+    assert!(auth.backend_mut().calls.is_empty());
+    assert!(select_channel(&mut auth, &mut catalog, Some(CHANNEL - 2), &events).await);
+    assert_eq!(catalog.error, Some(CatalogError::Unavailable));
     assert!(auth.backend_mut().calls.is_empty());
 }
 
@@ -235,7 +358,14 @@ async fn failed_channel_refresh_preserves_selection_books_and_cursor() {
     assert_eq!(catalog.next_offset, before.next_offset);
     assert_eq!(catalog.error, Some(CatalogError::Network));
     assert!(refresh_channels(&mut auth, &mut catalog, &events).await);
-    assert_eq!(catalog, before);
+    assert!(catalog.channels_loaded);
+    assert_eq!(
+        catalog,
+        CatalogState {
+            channels_loaded: true,
+            ..before
+        }
+    );
 }
 
 #[tokio::test]
@@ -298,6 +428,49 @@ async fn protection_changed_on_telegram_discards_previous_results() {
 }
 
 #[tokio::test]
+async fn restoring_the_same_account_after_catalog_revocation_republishes_its_inbox()
+-> Result<(), Box<dyn Error>> {
+    let (ui, backend) = connect();
+    let telegram = FakeTelegram {
+        steps: [AuthStep::Authorized, AuthStep::Authorized].into(),
+        pages: [Err(CatalogError::Unauthorized)].into(),
+        ..Default::default()
+    };
+    let task = tokio::spawn(async {
+        run_service(
+            &EmptyHistory,
+            telegram,
+            UnusedDownloads,
+            AppInfo {
+                settings: AppSettings::new("books".into()),
+                data_directory: "data".into(),
+                download_directory: "books".into(),
+            },
+            backend,
+        )
+        .await
+    });
+    while !matches!(ui.events.recv().await?, CoreEvent::Recommendations(_)) {}
+    ui.commands
+        .send(CoreCommand::SelectChannel(Some(CHANNEL)))
+        .await?;
+    let restored = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let CoreEvent::Recommendations(state) = ui.events.recv().await? {
+                return Ok::<_, async_channel::RecvError>(state);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(restored.account, Some(1));
+    assert!(restored.loaded);
+    assert!(!restored.monitoring);
+    ui.commands.send(CoreCommand::Shutdown).await?;
+    task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quit_cancels_an_in_flight_history_scan() -> Result<(), Box<dyn Error>> {
     let (ui, backend) = connect();
     let telegram = FakeTelegram {
@@ -311,6 +484,7 @@ async fn quit_cancels_an_in_flight_history_scan() -> Result<(), Box<dyn Error>> 
             telegram,
             UnusedDownloads,
             AppInfo {
+                settings: AppSettings::new("books".into()),
                 data_directory: "data".into(),
                 download_directory: "books".into(),
             },
@@ -321,11 +495,13 @@ async fn quit_cancels_an_in_flight_history_scan() -> Result<(), Box<dyn Error>> 
     for _ in 0..6 {
         ui.events.recv().await?;
     }
+    assert!(matches!(
+        ui.events.recv().await?,
+        CoreEvent::Recommendations(_)
+    ));
     ui.commands
         .send(CoreCommand::SelectChannel(Some(CHANNEL)))
         .await?;
-    ui.events.recv().await?;
-    ui.commands.send(CoreCommand::ScanNextPage).await?;
     assert!(matches!(
         ui.events.recv().await?,
         CoreEvent::Catalog(CatalogState {

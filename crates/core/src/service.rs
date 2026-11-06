@@ -4,11 +4,17 @@ use async_channel::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AuthAction, AuthState, AuthStep, Authentication, BookSource, CatalogError, CatalogOperation,
-    CatalogState, ChannelCatalog, DownloadEngine, DownloadKey, DownloadRecord, DownloadUpdate,
-    TransferMetrics, TransferState, auth::AuthController,
+    AppSettings, AuthAction, AuthState, AuthStep, Authentication, BookSource, CatalogError,
+    CatalogOperation, CatalogState, ChannelCatalog, DownloadEngine, DownloadKey, DownloadRecord,
+    DownloadUpdate, QueueStore, RecommendationError, RecommendationState, RecommendationStatus,
+    RecommendationStore, SettingsError, SettingsStore, SourceError, SourceStore, TransferMetrics,
+    TransferState, auth::AuthController,
 };
 
+#[path = "monitor_service.rs"]
+mod monitoring;
+#[path = "source_service.rs"]
+mod sources;
 #[path = "transfer_service.rs"]
 mod transfers;
 
@@ -23,14 +29,40 @@ pub trait DownloadHistory: Send + Sync {
 
 #[derive(Debug)]
 pub enum CoreCommand {
+    SetMonitoring {
+        account: i64,
+        enabled: bool,
+    },
+    ReloadRecommendations,
+    ChangeRecommendations {
+        account: i64,
+        keys: Vec<DownloadKey>,
+        status: RecommendationStatus,
+    },
+    DownloadRecommendations {
+        account: i64,
+        keys: Vec<DownloadKey>,
+    },
     RefreshHistory,
+    SaveSettings(AppSettings),
+    DownloadToDefault(Vec<DownloadKey>),
     Authenticate(AuthAction),
     RefreshChannels,
+    ReloadSources,
+    SetChannelSource {
+        id: i64,
+        enabled: bool,
+    },
     SelectChannel(Option<i64>),
     ScanNextPage,
     DownloadBooks {
         keys: Vec<DownloadKey>,
         directory: PathBuf,
+    },
+    RedownloadBook {
+        key: DownloadKey,
+        /// None resolves the last committed default directory inside Core.
+        directory: Option<PathBuf>,
     },
     CancelDownload(DownloadKey),
     SetQueuePaused(bool),
@@ -42,6 +74,7 @@ pub enum CoreCommand {
 pub struct AppInfo {
     pub data_directory: String,
     pub download_directory: String,
+    pub settings: AppSettings,
 }
 
 /// Only safe, typed errors cross the UI boundary, never raw API/SQL errors.
@@ -54,7 +87,12 @@ pub enum ServiceFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreEvent {
+    RecommendationBatch(crate::RecommendationBatch),
+    Recommendations(RecommendationState),
+    RecommendationActionFinished,
     Ready(AppInfo),
+    SettingsSaved(Result<AppSettings, SettingsError>),
+    SourceSaved(Result<(), SourceError>),
     HistoryLoaded(Vec<DownloadRecord>),
     Authentication(AuthState),
     Catalog(CatalogState),
@@ -109,7 +147,7 @@ async fn load_history(history: &impl DownloadHistory, events: &Sender<CoreEvent>
 /// One owner processes commands in order. Dropping the UI closes its command
 /// sender and event receiver; closing commands explicitly also stops the loop.
 pub async fn run_service(
-    history: &impl DownloadHistory,
+    history: &(impl DownloadHistory + QueueStore + SettingsStore + SourceStore + RecommendationStore),
     authentication: impl Authentication + ChannelCatalog + BookSource,
     downloads: impl DownloadEngine,
     info: AppInfo,
@@ -152,13 +190,14 @@ async fn authenticate(
 }
 
 async fn run_loop(
-    history: &impl DownloadHistory,
+    history: &(impl DownloadHistory + QueueStore + SettingsStore + SourceStore + RecommendationStore),
     authentication: impl Authentication + ChannelCatalog + BookSource,
     downloads: impl DownloadEngine,
     info: AppInfo,
     connection: ServiceConnection,
     running: &mut Option<transfers::RunningDownload>,
 ) {
+    let mut settings = info.settings.clone();
     if connection
         .events
         .send(CoreEvent::Ready(info))
@@ -178,26 +217,61 @@ async fn run_loop(
         return;
     }
     let mut auth = AuthController::new(authentication);
-    let mut catalog = CatalogState::default();
+    let mut catalog = CatalogState {
+        formats: settings.formats,
+        ..Default::default()
+    };
     if !authenticate(&mut auth, AuthAction::Restore, &connection.events).await {
         return;
     }
+    sources::sync(history, &auth, &mut catalog, false).await;
     if !catalog_after_auth(&mut auth, &mut catalog, &connection.events).await {
         return;
     }
 
     let (progress, progress_rx) = async_channel::bounded::<DownloadUpdate>(16);
     let mut queue = transfers::DownloadQueue::default();
+    if !restore_queue(history, &auth, &mut queue, running, &connection.events).await {
+        return;
+    }
+    let mut monitor = monitoring::Monitor::default();
     loop {
+        if queue.owner.is_some()
+            && queue.owner != auth.account_id()
+            && !restore_queue(history, &auth, &mut queue, running, &connection.events).await
+        {
+            break;
+        }
+        let sources_changed = sources::sync(history, &auth, &mut catalog, false).await;
+        if sources_changed && !send_catalog(&catalog, &connection.events).await {
+            break;
+        }
+        let inbox_changed = monitor.sync(history, &auth, &catalog, false).await;
+        if (inbox_changed || sources_changed) && !monitor.send(&connection.events).await {
+            break;
+        }
+        // Background RPCs run only between downloads and yield to ready UI commands.
+        if running.is_none() && monitor.due() && connection.commands.is_empty() {
+            if !monitor
+                .poll(history, &mut auth, &mut catalog, &connection.events)
+                .await
+            {
+                break;
+            }
+            continue;
+        }
         if running.is_none() && !queue.state.paused && !queue.state.queued.is_empty() {
             // A retry of the same key must not receive progress from its old worker.
             while progress_rx.try_recv().is_ok() {}
-            queue.start_next(&mut auth, &catalog, &downloads, &progress, running);
+            queue
+                .start_next(history, &mut auth, &catalog, &downloads, &progress, running)
+                .await;
             if !queue.send(running, &connection.events).await {
                 break;
             }
         }
         let command = tokio::select! {
+            biased;
             command = connection.commands.recv() => {
                 let Ok(command) = command else { break };
                 command
@@ -208,28 +282,52 @@ async fn run_loop(
                         DownloadUpdate::Record(record) => (record.key, CoreEvent::DownloadUpdated(record)),
                         DownloadUpdate::Metrics { key, metrics } => (key, CoreEvent::DownloadMetrics { key, metrics }),
                     };
-                    if running.as_ref().is_some_and(|job| job.book.key == key)
+                    if running.as_ref().is_some_and(|job| job.entry.book.key == key)
                         && connection.events.send(event).await.is_err()
                     { break; }
                 }
                 continue;
             }
-            result = transfers::wait(running) => {
+            mut result = transfers::wait(running) => {
                 let Some(job) = running.take() else { break };
-                if !queue.complete(result, job.book, &downloads, &mut auth, &mut catalog, &connection.events).await
-                    || !queue.send(running, &connection.events).await
+                let resumable = job.retain_on_shutdown && match &result {
+                    Ok(Err(error)) => error.is_resumable(),
+                    Err(_) => true,
+                    _ => false,
+                };
+                if resumable {
+                    let mut entry = job.entry.clone();
+                    entry.interrupted = true;
+                    queue.state.queued.insert(0, entry);
+                    queue.state.paused = true;
+                } else if matches!(result, Ok(Err(_)))
+                    && let Err(error) = downloads.discard(&job.entry).await
+                {
+                    result = Ok(Err(error));
+                    queue.state.paused = true;
+                }
+                if !queue.complete(result, job.entry.book, &downloads, &mut auth, &mut catalog, &connection.events).await
+                { break; }
+                if queue.owner.is_some() { queue.persist(history, running).await; }
+                if !queue.send(running, &connection.events).await
                     || !load_history(history, &connection.events).await
                 { break; }
+                monitor.sync(history, &auth, &catalog, true).await;
+                if !monitor.send(&connection.events).await { break; }
+                continue;
+            }
+            _ = tokio::time::sleep_until(monitor.next), if monitor.state.monitoring && running.is_none() => {
+                if !monitor.poll(history, &mut auth, &mut catalog, &connection.events).await { break; }
                 continue;
             }
         };
         // Keep the Telegram connection under one network workflow at a time.
         // In particular, CancelDownload must not queue behind a 60-second scan.
         if running.is_some()
-            && matches!(
+            && (matches!(
                 &command,
                 CoreCommand::RefreshChannels | CoreCommand::ScanNextPage
-            )
+            ) || matches!(&command, CoreCommand::SelectChannel(Some(id)) if catalog.selected != Some(*id)))
         {
             catalog.reject(CatalogError::Busy);
             if !send_catalog(&catalog, &connection.events).await {
@@ -237,9 +335,172 @@ async fn run_loop(
             }
             continue;
         }
+        let recommendation_action = matches!(
+            &command,
+            CoreCommand::SetMonitoring { .. }
+                | CoreCommand::ReloadRecommendations
+                | CoreCommand::ChangeRecommendations { .. }
+                | CoreCommand::DownloadRecommendations { .. }
+        );
         match command {
+            CoreCommand::SetMonitoring { account, enabled } => {
+                if auth.account_id() != Some(account) || monitor.state.account != Some(account) {
+                    monitor.state.error = Some(RecommendationError::Unauthorized);
+                } else {
+                    monitor.set_enabled(history, enabled, &auth, &catalog).await;
+                }
+                if !monitor.send(&connection.events).await {
+                    break;
+                }
+            }
+            CoreCommand::ReloadRecommendations => {
+                monitor.sync(history, &auth, &catalog, true).await;
+                if !monitor.send(&connection.events).await {
+                    break;
+                }
+            }
+            CoreCommand::ChangeRecommendations {
+                account,
+                keys,
+                status,
+            } => {
+                let result = if auth.account_id() != Some(account)
+                    || monitor.state.account != Some(account)
+                {
+                    Err(RecommendationError::Unauthorized)
+                } else if keys.is_empty() || keys.len() > crate::MAX_PENDING_DOWNLOADS {
+                    Err(RecommendationError::Unavailable)
+                } else {
+                    history
+                        .set_recommendation_status(account, &keys, status)
+                        .await
+                };
+                if let Err(error) = result {
+                    monitor.state.error = Some(error);
+                } else {
+                    monitor.sync(history, &auth, &catalog, true).await;
+                }
+                if !monitor.send(&connection.events).await {
+                    break;
+                }
+            }
+            CoreCommand::DownloadRecommendations { account, keys } => {
+                if auth.account_id() != Some(account) || monitor.state.account != Some(account) {
+                    monitor.state.error = Some(RecommendationError::Unauthorized);
+                } else if keys.len() > crate::MAX_PENDING_DOWNLOADS {
+                    monitor.state.error = Some(RecommendationError::Download(
+                        crate::DownloadError::QueueFull,
+                    ));
+                } else {
+                    let books: Vec<_> = keys
+                        .iter()
+                        .filter_map(|key| {
+                            monitor
+                                .state
+                                .items
+                                .iter()
+                                .find(|item| {
+                                    item.book.key == *key
+                                        && item.status != RecommendationStatus::Hidden
+                                })
+                                .map(|item| item.book.clone())
+                        })
+                        .collect();
+                    if books.len() != keys.len()
+                        || keys.is_empty()
+                        || books.iter().any(|book| {
+                            !catalog
+                                .channels
+                                .iter()
+                                .any(|channel| channel.id == book.key.channel_id)
+                        })
+                    {
+                        monitor.state.error = Some(RecommendationError::Unavailable);
+                    } else {
+                        let snapshot = CatalogState {
+                            books,
+                            ..catalog.clone()
+                        };
+                        if !enqueue_downloads(
+                            history,
+                            &auth,
+                            &snapshot,
+                            &mut queue,
+                            running,
+                            &connection.events,
+                            (keys.clone(), settings.download_directory.clone(), false),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if let Some(error) = queue.state.error {
+                            monitor.state.error = Some(RecommendationError::Download(error));
+                        } else {
+                            let admitted: Vec<_> = keys
+                                .into_iter()
+                                .filter(|key| {
+                                    queue.state.queued.iter().any(|job| job.book.key == *key)
+                                        || running
+                                            .as_ref()
+                                            .is_some_and(|job| job.entry.book.key == *key)
+                                })
+                                .collect();
+                            match history
+                                .set_recommendation_status(
+                                    account,
+                                    &admitted,
+                                    RecommendationStatus::Read,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    monitor.sync(history, &auth, &catalog, true).await;
+                                }
+                                Err(error) => monitor.state.error = Some(error),
+                            }
+                        }
+                    }
+                }
+                if !monitor.send(&connection.events).await {
+                    break;
+                }
+            }
+            CoreCommand::SaveSettings(draft) => {
+                let result = if running.is_some() {
+                    Err(SettingsError::Busy)
+                } else {
+                    history.save_settings(&draft).await
+                };
+                let mut formats_changed = false;
+                if let Ok(accepted) = &result {
+                    formats_changed = catalog.set_formats(accepted.formats);
+                    settings = accepted.clone();
+                }
+                if connection
+                    .events
+                    .send(CoreEvent::SettingsSaved(result))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if formats_changed {
+                    if !send_catalog(&catalog, &connection.events).await {
+                        break;
+                    }
+                    if catalog.can_scan()
+                        && !scan_next_page(&mut auth, &mut catalog, &connection.events).await
+                    {
+                        break;
+                    }
+                }
+            }
             CoreCommand::RefreshHistory => {
                 if !load_history(history, &connection.events).await {
+                    break;
+                }
+                if !restore_queue(history, &auth, &mut queue, running, &connection.events).await {
                     break;
                 }
             }
@@ -260,25 +521,46 @@ async fn run_loop(
                 if !authenticate(&mut auth, action, &connection.events).await {
                     break;
                 }
+                sources::sync(history, &auth, &mut catalog, false).await;
                 if !catalog_after_auth(&mut auth, &mut catalog, &connection.events).await {
+                    break;
+                }
+                if !restore_queue(history, &auth, &mut queue, running, &connection.events).await {
                     break;
                 }
             }
             CoreCommand::RefreshChannels => {
+                sources::sync(history, &auth, &mut catalog, true).await;
                 if !refresh_channels(&mut auth, &mut catalog, &connection.events).await {
                     break;
                 }
             }
-            CoreCommand::SelectChannel(id) => {
-                let result = if auth.state().step == AuthStep::Authorized {
-                    catalog.select(id)
-                } else {
-                    Err(CatalogError::Unauthorized)
-                };
-                if let Err(error) = result {
-                    catalog.reject(error);
-                }
+            CoreCommand::ReloadSources => {
+                sources::sync(history, &auth, &mut catalog, true).await;
                 if !send_catalog(&catalog, &connection.events).await {
+                    break;
+                }
+            }
+            CoreCommand::SetChannelSource { id, enabled } => {
+                let result = sources::set(history, &auth, &mut catalog, id, enabled).await;
+                if !send_catalog(&catalog, &connection.events).await
+                    || connection
+                        .events
+                        .send(CoreEvent::SourceSaved(result))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+                if catalog.sources.channels.is_empty() && monitor.state.monitoring {
+                    monitor.set_enabled(history, false, &auth, &catalog).await;
+                    if !monitor.send(&connection.events).await {
+                        break;
+                    }
+                }
+            }
+            CoreCommand::SelectChannel(id) => {
+                if !select_channel(&mut auth, &mut catalog, id, &connection.events).await {
                     break;
                 }
             }
@@ -288,27 +570,73 @@ async fn run_loop(
                 }
             }
             CoreCommand::DownloadBooks { keys, directory } => {
-                match history.list_downloads().await {
-                    Ok(records) => {
-                        queue.enqueue(keys, directory, &auth, &catalog, running, &records)
-                    }
-                    Err(_) => queue.reject(crate::DownloadError::Storage),
+                if !enqueue_downloads(
+                    history,
+                    &auth,
+                    &catalog,
+                    &mut queue,
+                    running,
+                    &connection.events,
+                    (keys, directory, false),
+                )
+                .await
+                {
+                    break;
                 }
-                if !queue.send(running, &connection.events).await {
+            }
+            CoreCommand::DownloadToDefault(keys) => {
+                if !enqueue_downloads(
+                    history,
+                    &auth,
+                    &catalog,
+                    &mut queue,
+                    running,
+                    &connection.events,
+                    (keys, settings.download_directory.clone(), false),
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            CoreCommand::RedownloadBook { key, directory } => {
+                if !enqueue_downloads(
+                    history,
+                    &auth,
+                    &catalog,
+                    &mut queue,
+                    running,
+                    &connection.events,
+                    (
+                        vec![key],
+                        directory.unwrap_or_else(|| settings.download_directory.clone()),
+                        true,
+                    ),
+                )
+                .await
+                {
                     break;
                 }
             }
             CoreCommand::CancelDownload(key) => {
-                if let Some(job) = running.as_ref().filter(|job| job.book.key == key) {
-                    job.cancel();
-                } else {
-                    queue.state.queued.retain(|job| job.book.key != key);
-                }
+                queue.cancel(key, history, &downloads, running).await;
                 if !queue.send(running, &connection.events).await {
                     break;
                 }
             }
             CoreCommand::SetQueuePaused(paused) => {
+                if !restore_queue(history, &auth, &mut queue, running, &connection.events).await {
+                    break;
+                }
+                if queue.owner.is_none() {
+                    if auth.state().step != AuthStep::Authorized {
+                        queue.reject(crate::DownloadError::Unauthorized);
+                        if !queue.send(running, &connection.events).await {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 queue.set_paused(paused, &auth);
                 if !queue.send(running, &connection.events).await {
                     break;
@@ -316,13 +644,86 @@ async fn run_loop(
             }
             CoreCommand::Shutdown => break,
         }
+        if recommendation_action
+            && connection
+                .events
+                .send(CoreEvent::RecommendationActionFinished)
+                .await
+                .is_err()
+        {
+            break;
+        }
         if auth.state().step != AuthStep::Authorized && !queue.state.queued.is_empty() {
-            queue.state.queued.clear();
-            queue.state.paused = true;
+            queue.forget_account();
             queue.reject(crate::DownloadError::Unauthorized);
             if !queue.send(running, &connection.events).await {
                 break;
             }
+        }
+    }
+}
+
+async fn enqueue_downloads(
+    history: &(impl DownloadHistory + QueueStore),
+    auth: &AuthController<impl Authentication>,
+    catalog: &CatalogState,
+    queue: &mut transfers::DownloadQueue,
+    running: &Option<transfers::RunningDownload>,
+    events: &Sender<CoreEvent>,
+    (keys, directory, redownload): (Vec<DownloadKey>, PathBuf, bool),
+) -> bool {
+    if !restore_queue(history, auth, queue, running, events).await {
+        return false;
+    }
+    if queue.owner.is_none() {
+        if auth.state().step != AuthStep::Authorized {
+            queue.reject(crate::DownloadError::Unauthorized);
+            return queue.send(running, events).await;
+        }
+        // restore_queue already reported its failure. Do not emit a second
+        // acknowledgement that could be mistaken for the next command's reply.
+        return true;
+    }
+    match history.list_downloads().await {
+        Ok(records) => {
+            let mut next = queue.clone();
+            if redownload {
+                next.enqueue_with_policy(keys, directory, auth, catalog, running, (&records, true));
+            } else {
+                next.enqueue(keys, directory, auth, catalog, running, &records);
+            }
+            if next.state.queued == queue.state.queued {
+                *queue = next;
+            } else {
+                queue.commit(next, history, running).await;
+            }
+        }
+        Err(_) => {
+            queue.reject(crate::DownloadError::Storage);
+            queue.state.paused = true;
+        }
+    }
+    queue.send(running, events).await
+}
+
+async fn restore_queue(
+    store: &(impl DownloadHistory + QueueStore),
+    auth: &AuthController<impl Authentication>,
+    queue: &mut transfers::DownloadQueue,
+    running: &Option<transfers::RunningDownload>,
+    events: &Sender<CoreEvent>,
+) -> bool {
+    if auth.state().step != AuthStep::Authorized {
+        queue.forget_account();
+        return true;
+    }
+    match queue.restore(store, auth).await {
+        Ok(false) => true,
+        Ok(true) => queue.send(running, events).await,
+        Err(error) => {
+            queue.reject(error);
+            queue.state.paused = true;
+            queue.send(running, events).await
         }
     }
 }
@@ -340,7 +741,7 @@ async fn catalog_after_auth(
     if state.step == AuthStep::Authorized && state.error.is_none() {
         refresh_channels(auth, catalog, events).await
     } else if state.step != AuthStep::Authorized && catalog.authenticated {
-        *catalog = CatalogState::default();
+        catalog.clear_authorization(None);
         send_catalog(catalog, events).await
     } else {
         true
@@ -357,10 +758,7 @@ async fn catalog_failure(
         auth.record_flood_wait(seconds);
     }
     if error == CatalogError::Unauthorized {
-        *catalog = CatalogState {
-            error: Some(error),
-            ..Default::default()
-        };
+        catalog.clear_authorization(Some(error));
         if !send_catalog(catalog, events).await {
             return false;
         }
@@ -382,10 +780,7 @@ async fn refresh_channels(
     events: &Sender<CoreEvent>,
 ) -> bool {
     if auth.state().step != AuthStep::Authorized {
-        *catalog = CatalogState {
-            error: Some(CatalogError::Unauthorized),
-            ..Default::default()
-        };
+        catalog.clear_authorization(Some(CatalogError::Unauthorized));
         return send_catalog(catalog, events).await;
     }
     catalog.authenticated = true;
@@ -394,6 +789,7 @@ async fn refresh_channels(
         return send_catalog(catalog, events).await;
     }
     catalog.operation = Some(CatalogOperation::ListChannels);
+    catalog.channels_loaded = false;
     catalog.error = None;
     if !send_catalog(catalog, events).await {
         return false;
@@ -408,16 +804,38 @@ async fn refresh_channels(
     }
 }
 
+/// A new source loads its first page as one actor operation, not a second UI
+/// command. Publishing ScanHistory first keeps selection busy until it finishes.
+async fn select_channel(
+    auth: &mut AuthController<impl Authentication + ChannelCatalog>,
+    catalog: &mut CatalogState,
+    id: Option<i64>,
+    events: &Sender<CoreEvent>,
+) -> bool {
+    let previous = catalog.selected;
+    let result = if auth.state().step == AuthStep::Authorized {
+        catalog.select(id)
+    } else {
+        Err(CatalogError::Unauthorized)
+    };
+    if let Err(error) = result {
+        catalog.reject(error);
+        return send_catalog(catalog, events).await;
+    }
+    if previous != catalog.selected && catalog.can_scan() {
+        scan_next_page(auth, catalog, events).await
+    } else {
+        send_catalog(catalog, events).await
+    }
+}
+
 async fn scan_next_page(
     auth: &mut AuthController<impl Authentication + ChannelCatalog>,
     catalog: &mut CatalogState,
     events: &Sender<CoreEvent>,
 ) -> bool {
     if auth.state().step != AuthStep::Authorized {
-        *catalog = CatalogState {
-            error: Some(CatalogError::Unauthorized),
-            ..Default::default()
-        };
+        catalog.clear_authorization(Some(CatalogError::Unauthorized));
         return send_catalog(catalog, events).await;
     }
     if catalog
@@ -492,6 +910,25 @@ mod tests {
     }
 
     struct EmptyHistory;
+    impl SettingsStore for EmptyHistory {}
+    impl SourceStore for EmptyHistory {}
+    impl RecommendationStore for EmptyHistory {}
+
+    impl QueueStore for EmptyHistory {
+        async fn load_queue(
+            &self,
+            _: i64,
+        ) -> Result<Vec<crate::QueuedDownload>, crate::DownloadError> {
+            Ok(Vec::new())
+        }
+        async fn save_queue(
+            &self,
+            _: i64,
+            _: &[crate::QueuedDownload],
+        ) -> Result<(), crate::DownloadError> {
+            Ok(())
+        }
+    }
 
     impl DownloadHistory for EmptyHistory {
         type Error = Infallible;
@@ -502,6 +939,25 @@ mod tests {
     }
 
     struct BrokenHistory;
+    impl SettingsStore for BrokenHistory {}
+    impl SourceStore for BrokenHistory {}
+    impl RecommendationStore for BrokenHistory {}
+
+    impl QueueStore for BrokenHistory {
+        async fn load_queue(
+            &self,
+            _: i64,
+        ) -> Result<Vec<crate::QueuedDownload>, crate::DownloadError> {
+            Err(crate::DownloadError::Storage)
+        }
+        async fn save_queue(
+            &self,
+            _: i64,
+            _: &[crate::QueuedDownload],
+        ) -> Result<(), crate::DownloadError> {
+            Err(crate::DownloadError::Storage)
+        }
+    }
 
     impl DownloadHistory for BrokenHistory {
         type Error = io::Error;
@@ -513,6 +969,7 @@ mod tests {
 
     fn info() -> AppInfo {
         AppInfo {
+            settings: AppSettings::new("books".into()),
             data_directory: "data".into(),
             download_directory: "books".into(),
         }

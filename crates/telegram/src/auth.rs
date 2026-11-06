@@ -8,7 +8,7 @@ use grammers_client::{
     InvocationError, SignInError,
     client::{LoginToken, PasswordToken},
 };
-use tgbooks_core::{AuthAction, AuthError, AuthFailure, AuthStep, Authentication};
+use tgbooks_core::{AccountProfile, AuthAction, AuthError, AuthFailure, AuthStep, Authentication};
 
 use crate::{
     ApiCredentials, TelegramConnection,
@@ -24,6 +24,7 @@ pub struct TelegramAuth {
     login: Option<LoginToken>,
     password: Option<PasswordToken>,
     step: AuthStep,
+    profile: Option<AccountProfile>,
     pub(crate) channels: HashMap<i64, grammers_session::types::PeerRef>,
 }
 
@@ -36,6 +37,7 @@ impl TelegramAuth {
             login: None,
             password: None,
             step: AuthStep::Credentials,
+            profile: None,
             channels: HashMap::new(),
         }
     }
@@ -46,6 +48,7 @@ impl TelegramAuth {
         }
         self.login = None;
         self.password = None;
+        self.profile = None;
         self.channels.clear();
     }
 
@@ -84,13 +87,19 @@ impl TelegramAuth {
                 }
                 self.connect()?;
                 let client = self.client()?;
-                let authorized = timed(client.is_authorized())
+                // Validate the session and get the display identity in one RPC.
+                let user = timed(client.get_me())
                     .await
-                    .map_err(|kind| failure(kind, AuthStep::Phone))?
-                    .map_err(|error| rpc_failure(error, AuthStep::Phone))?;
-                if authorized {
-                    Ok(AuthStep::Authorized)
-                } else {
+                    .map_err(|kind| failure(kind, AuthStep::Phone))?;
+                match user {
+                    Ok(user) => {
+                        self.profile = Some(profile(&user));
+                        return Ok(AuthStep::Authorized);
+                    }
+                    Err(InvocationError::Rpc(error)) if error.code == 401 => {}
+                    Err(error) => return Err(rpc_failure(error, AuthStep::Phone)),
+                }
+                {
                     // Revoked keys must not be reused for a new login handshake.
                     self.disconnect().await;
                     let session = self
@@ -152,7 +161,8 @@ impl TelegramAuth {
                     .await
                     .map_err(|kind| failure(kind, AuthStep::Code))?
                 {
-                    Ok(_) => {
+                    Ok(user) => {
+                        self.profile = Some(profile(&user));
                         self.login = None;
                         self.password = None;
                         Ok(AuthStep::Authorized)
@@ -185,7 +195,8 @@ impl TelegramAuth {
                     .await
                     .map_err(|kind| failure(kind, AuthStep::Code))?
                 {
-                    Ok(_) => {
+                    Ok(user) => {
+                        self.profile = Some(profile(&user));
                         self.login = None;
                         Ok(AuthStep::Authorized)
                     }
@@ -235,6 +246,19 @@ impl TelegramAuth {
 }
 
 impl Authentication for TelegramAuth {
+    fn profile(&self) -> Option<AccountProfile> {
+        (self.step == AuthStep::Authorized)
+            .then(|| self.profile.clone())
+            .flatten()
+    }
+
+    fn account_id(&self) -> Option<i64> {
+        if self.step != AuthStep::Authorized {
+            return None;
+        }
+        self.session.as_ref()?.account_id().ok().flatten()
+    }
+
     async fn execute(&mut self, action: AuthAction) -> Result<AuthStep, AuthFailure> {
         // Grammers 0.11 still panics on some unsupported login replies (e.g.
         // PaymentRequired). Contain that at the adapter boundary, not in GPUI.
@@ -257,6 +281,13 @@ impl Authentication for TelegramAuth {
             Err(error) => error.step,
         };
         result
+    }
+}
+
+fn profile(user: &grammers_client::peer::User) -> AccountProfile {
+    AccountProfile {
+        username: user.username().map(str::to_owned),
+        name: user.full_name(),
     }
 }
 

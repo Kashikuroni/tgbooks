@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod backend;
 mod platform;
 mod ui;
@@ -34,6 +39,16 @@ fn run() -> Result<()> {
         .context("could not initialize logging")?;
 
     #[cfg(feature = "gpui-tests")]
+    if std::env::args().any(|argument| argument == "--render-app-icon") {
+        return ui::preview::render_app_icon();
+    }
+
+    #[cfg(feature = "gpui-tests")]
+    if std::env::args().any(|argument| argument == "--render-icon-concepts") {
+        return ui::preview::render_icon_concepts();
+    }
+
+    #[cfg(feature = "gpui-tests")]
     if std::env::args().any(|argument| argument == "--render-ui-preview") {
         return ui::preview::render();
     }
@@ -47,7 +62,12 @@ fn run() -> Result<()> {
     let (ui_connection, service_connection) = tgbooks_core::connect();
     let commands = ui_connection.commands.clone();
     let cancellation = ui_connection.shutdown.clone();
-    let backend = runtime.spawn(backend::run(service_connection));
+    let (start, ready) = async_channel::bounded(1);
+    let backend = runtime.spawn(async move {
+        if wait_for_start(ready, service_connection.shutdown.cancelled()).await {
+            backend::run(service_connection).await;
+        }
+    });
 
     // AppKit can terminate the process without returning from the event loop.
     // Await cleanup inside GPUI's quit hook, not only after ui::run returns.
@@ -58,9 +78,20 @@ fn run() -> Result<()> {
             tracing::error!("background service terminated unexpectedly");
         }
     };
-    let result = ui::run(ui_connection, shutdown);
+    let result = ui::run(ui_connection, shutdown, start, runtime.handle().clone());
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+async fn wait_for_start(
+    ready: async_channel::Receiver<()>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown => false,
+        result = ready.recv() => result.is_ok(),
+    }
 }
 
 fn application_log_enabled(target: &str, level: tracing::Level) -> bool {
@@ -72,6 +103,29 @@ fn application_log_enabled(target: &str, level: tracing::Level) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_gate_waits_for_consent_and_shutdown_never_starts_the_backend() {
+        let (_ui, backend) = tgbooks_core::connect();
+        let (start, ready) = async_channel::bounded(1);
+        let waiting = wait_for_start(ready, backend.shutdown.cancelled());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(start.try_send(()).is_ok());
+        assert!(waiting.await);
+
+        let (start, ready) = async_channel::bounded(1);
+        assert!(start.try_send(()).is_ok());
+        backend.shutdown.cancel();
+        assert!(!wait_for_start(ready, backend.shutdown.cancelled()).await);
+        let (start, ready) = async_channel::bounded(1);
+        drop(start);
+        assert!(!wait_for_start(ready, std::future::pending()).await);
+    }
 
     #[test]
     fn logs_include_the_binary_but_exclude_third_party_and_verbose_events() {

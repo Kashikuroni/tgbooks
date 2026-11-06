@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+plist = "=1.8.0"
+png = "=0.18.1"
+
+[dev-dependencies]
+toml = "=1.1.8"
+roxmltree = "=0.21.2"

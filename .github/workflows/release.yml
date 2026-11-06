@@ -1,0 +1,82 @@
+name: Pre-release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - name: Validate tag against Cargo and require release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo xtask check-release "$RELEASE_TAG"
+
+  build:
+    name: Build both native packages
+    needs: validate
+    uses: ./.github/workflows/package.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish unsigned pre-release
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup show
+      - name: Download macOS package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tgbooks-test-macos
+          path: target/release-assets
+      - name: Download Windows package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tgbooks-test-windows
+          path: target/release-assets
+      - name: Verify exact asset set and SHA-256
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo xtask verify-release "$RELEASE_TAG" target/release-assets
+      - name: Upload to draft, then publish as pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_COMMIT"
+          test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          # Refuse to replace existing release assets. A failed upload leaves
+          # an unpublished draft, never a publicly visible partial release.
+          gh release create "$RELEASE_TAG" target/release-assets/* \
+            --verify-tag --draft --prerelease --latest=false \
+            --title "Telegram Books $RELEASE_TAG (test build)" \
+            --notes-file "release-notes/$RELEASE_TAG.md"
+          test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false --verify-tag

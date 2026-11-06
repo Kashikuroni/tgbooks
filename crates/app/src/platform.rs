@@ -2,6 +2,24 @@
 
 use gpui::{Bounds, Pixels, TitlebarOptions, WindowOptions, point, px, size};
 
+#[cfg(target_os = "macos")]
+pub(crate) mod install;
+
+pub const APP_ID: &str = "org.tgbooks.TelegramBookDownloader";
+pub const APP_NAME: &str = "Telegram Books";
+
+pub fn notification_support(cx: &gpui::App) -> bool {
+    if cfg!(target_os = "macos") {
+        // Call only with the real platform during startup (test/headless
+        // platforms do not implement app_path). GPUI also guards the native API.
+        cx.app_path()
+            .ok()
+            .is_some_and(|path| path.extension().is_some_and(|ext| ext == "app"))
+    } else {
+        cfg!(target_os = "windows")
+    }
+}
+
 pub fn window_options(bounds: Bounds<Pixels>) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
@@ -36,4 +54,8 @@ pub fn shortcut(macos: &'static str, windows: &'static str) -> &'static str {
 
 pub fn reveal_file(path: &str, cx: &mut gpui::App) {
     cx.reveal_path(std::path::Path::new(path));
+}
+
+pub fn open_file(path: &str, cx: &mut gpui::App) {
+    cx.open_with_system(std::path::Path::new(path));
 }

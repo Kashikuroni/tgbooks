@@ -54,9 +54,21 @@ pub(super) fn labels(progress: DownloadProgress, metrics: TransferMetrics) -> (S
     let time = progress
         .total_bytes()
         .and(metrics.remaining_seconds)
-        .map(|seconds| format!("{} мин", seconds.div_ceil(60).max(1)))
+        .map(eta_label)
         .unwrap_or_else(|| "—".into());
     (speed, time)
+}
+
+fn eta_label(seconds: u64) -> String {
+    // Round once, before splitting units: never show "1 ч 60 мин".
+    let minutes = seconds.div_ceil(60).max(1);
+    let hours = minutes / 60;
+    let remainder = minutes % 60;
+    match (hours, remainder) {
+        (0, _) => format!("{minutes} мин"),
+        (_, 0) => format!("{hours} ч"),
+        _ => format!("{hours} ч {remainder} мин"),
+    }
 }
 
 fn speed_label(bytes: u64) -> String {
@@ -190,14 +202,21 @@ mod tests {
             ),
             ("400 КБ/с".into(), "46 мин".into())
         );
-        for (seconds, minutes) in [
-            (0, 1),
-            (1, 1),
-            (59, 1),
-            (60, 1),
-            (61, 2),
-            (3661, 62),
-            (90000, 1500),
+        for (seconds, expected) in [
+            (0, "1 мин"),
+            (1, "1 мин"),
+            (59, "1 мин"),
+            (60, "1 мин"),
+            (61, "2 мин"),
+            (3540, "59 мин"),
+            (3599, "1 ч"),
+            (3600, "1 ч"),
+            (3601, "1 ч 1 мин"),
+            (3661, "1 ч 2 мин"),
+            (7199, "2 ч"),
+            (7200, "2 ч"),
+            (9300, "2 ч 35 мин"),
+            (90000, "25 ч"),
         ] {
             assert_eq!(
                 labels(
@@ -207,7 +226,7 @@ mod tests {
                         remaining_seconds: Some(seconds)
                     }
                 ),
-                ("2 КБ/с".into(), format!("{minutes} мин"))
+                ("2 КБ/с".into(), expected.into())
             );
         }
         assert_eq!(speed_label(0), "0 Б/с");

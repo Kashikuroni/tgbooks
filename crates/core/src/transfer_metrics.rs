@@ -31,6 +31,15 @@ impl Default for TransferMeter {
 }
 
 impl TransferMeter {
+    /// Seed a resumed attempt without counting previously downloaded bytes as
+    /// newly received traffic or inflating the speed/shortening the ETA.
+    pub fn starting_at(bytes: u64) -> Self {
+        Self {
+            samples: VecDeque::from([(Duration::ZERO, bytes)]),
+            last: (Duration::ZERO, bytes),
+        }
+    }
+
     /// The adapter supplies elapsed monotonic time, including time without bytes.
     /// Reset if an attempt restarts or the supplied clock moves backwards.
     pub fn observe(&mut self, progress: DownloadProgress, elapsed: Duration) -> TransferMetrics {
@@ -106,6 +115,16 @@ mod tests {
         let metrics = sample(&mut meter, 1_048_576, Some(1_400_000_000), 1000)?;
         assert_eq!(metrics.bytes_per_second, Some(1_048_576));
         assert_eq!(metrics.remaining_seconds, Some(1335));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_counts_only_new_bytes_for_speed_but_all_bytes_for_eta() -> Result<(), InvalidProgress>
+    {
+        let mut meter = TransferMeter::starting_at(1_000_000);
+        let metrics = sample(&mut meter, 1_001_000, Some(1_010_000), 1000)?;
+        assert_eq!(metrics.bytes_per_second, Some(1000));
+        assert_eq!(metrics.remaining_seconds, Some(9));
         Ok(())
     }
 

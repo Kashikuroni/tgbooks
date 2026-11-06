@@ -1,0 +1,28 @@
+Telegram Books — third-party notices
+
+This file lists dependencies for the native release target, including transitive
+and build dependencies. Application code is covered separately by LICENSE,
+NOTICE and LICENSE-APACHE. Exact dependency versions and Git revisions are
+recorded in Cargo.lock in the source archive for this release.
+
+Unmodified dependency sources are available from the repositories listed below
+or the corresponding crate/version at https://crates.io. This includes sources
+of components licensed under MPL-2.0.
+
+SQLite, bundled by libsqlite3-sys, is in the public domain:
+https://sqlite.org/copyright.html
+
+{{#each licenses}}
+========================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}
+  Repository: {{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}/{{{crate.version}}}{{/if}}
+  Source: {{{crate.source}}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

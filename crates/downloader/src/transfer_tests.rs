@@ -17,6 +17,21 @@ struct Chunks {
 }
 
 impl BookChunks for Chunks {
+    fn seek(&mut self, mut offset: u64) -> Result<(), DownloadError> {
+        while offset > 0 {
+            let Some(Ok(chunk)) = self.chunks.front_mut() else {
+                return Err(DownloadError::Incomplete);
+            };
+            let skip = offset.min(chunk.len() as u64) as usize;
+            chunk.drain(..skip);
+            offset -= skip as u64;
+            if chunk.is_empty() {
+                self.chunks.pop_front();
+            }
+        }
+        Ok(())
+    }
+
     fn next_chunk(&mut self) -> ChunkFuture<'_> {
         Box::pin(async {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -46,6 +61,7 @@ fn remote(
     (
         RemoteBook {
             book,
+            source_title: Some("Книжная полка".into()),
             chunks: Box::new(Chunks {
                 chunks: chunks.into(),
                 calls: calls.clone(),
@@ -79,6 +95,9 @@ fn progress() -> (
     async_channel::bounded(16)
 }
 
+#[path = "resume_tests.rs"]
+mod resume_tests;
+
 #[tokio::test]
 async fn streamed_bytes_history_and_deduplication_survive_restart()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -98,6 +117,15 @@ async fn streamed_bytes_history_and_deduplication_survive_restart()
         )
         .await?;
     assert_eq!(saved.status, DownloadStatus::Completed);
+    assert_eq!(saved.file_name, attachment.file_name);
+    assert_eq!(saved.source_title.as_deref(), Some("Книжная полка"));
+    assert!(saved.added_at > 0);
+    assert_ne!(
+        Path::new(&saved.local_path)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(saved.file_name.as_str())
+    );
     assert_eq!(saved.progress.percentage(), Some(100));
     assert_eq!(tokio::fs::read(&saved.local_path).await?, b"helloworld");
     assert_eq!(
@@ -118,6 +146,112 @@ async fn streamed_bytes_history_and_deduplication_survive_restart()
         Err(DownloadError::AlreadyDownloaded)
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_copy_preserves_old_files_and_history_and_never_overwrites()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (root, first_folder, storage, downloader) = setup().await?;
+    let second_folder = root.path().join("Вторая папка");
+    let failed_folder = root.path().join("Failed");
+    tokio::fs::create_dir(&second_folder).await?;
+    tokio::fs::create_dir(&failed_folder).await?;
+    let attachment = book("book.epub", Some(3));
+    let (updates, _receiver) = async_channel::unbounded();
+    let (source, _) = remote(attachment.clone(), vec![Ok(b"one".to_vec())]);
+    let original = downloader
+        .save(
+            source,
+            first_folder,
+            updates.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
+    let (source, calls) = remote(attachment.clone(), vec![Ok(b"two".to_vec())]);
+    assert_eq!(
+        downloader
+            .save(
+                source,
+                second_folder.clone(),
+                updates.clone(),
+                CancellationToken::new()
+            )
+            .await,
+        Err(DownloadError::AlreadyDownloaded)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (source, _) = remote(attachment.clone(), vec![Ok(b"two".to_vec())]);
+    let copy = downloader
+        .save_again(
+            source,
+            second_folder.clone(),
+            updates.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_ne!(copy.local_path, original.local_path);
+    assert_eq!(tokio::fs::read(&original.local_path).await?, b"one");
+    assert_eq!(tokio::fs::read(&copy.local_path).await?, b"two");
+    let before = storage.list_downloads().await?;
+    let (source, calls) = remote(attachment.clone(), vec![Ok(b"BAD".to_vec())]);
+    assert_eq!(
+        downloader
+            .save_again(
+                source,
+                second_folder.clone(),
+                updates.clone(),
+                CancellationToken::new()
+            )
+            .await,
+        Err(DownloadError::FileExists)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.list_downloads().await?, before);
+    assert_eq!(tokio::fs::read(&copy.local_path).await?, b"two");
+
+    let (source, _) = remote(attachment.clone(), vec![Err(DownloadError::Network)]);
+    assert_eq!(
+        downloader
+            .save_again(
+                source,
+                failed_folder.clone(),
+                updates.clone(),
+                CancellationToken::new()
+            )
+            .await,
+        Err(DownloadError::Network)
+    );
+    assert_eq!(
+        std::fs::read_dir(failed_folder)?.count(),
+        1,
+        "checkpoint retains the partial copy"
+    );
+    assert_eq!(
+        storage
+            .list_downloads()
+            .await?
+            .iter()
+            .filter(|row| row.status == DownloadStatus::Completed)
+            .count(),
+        2
+    );
+
+    // Explicitly downloading a missing file to its old path is supported too.
+    tokio::fs::remove_file(&copy.local_path).await?;
+    let (source, _) = remote(attachment, vec![Ok(b"new".to_vec())]);
+    downloader
+        .save_again(source, second_folder, updates, CancellationToken::new())
+        .await?;
+    storage.close().await;
+    let reopened = Storage::open(&root.path().join("downloads.sqlite3")).await?;
+    let history = reopened.list_downloads().await?;
+    assert_eq!(history.len(), 3);
+    assert!(history.contains(&original));
+    assert_eq!(tokio::fs::read(&original.local_path).await?, b"one");
+    assert_eq!(tokio::fs::read(&copy.local_path).await?, b"new");
+    reopened.close().await;
     Ok(())
 }
 
@@ -148,7 +282,7 @@ async fn unknown_and_empty_sizes_finish_with_actual_length()
 }
 
 #[tokio::test]
-async fn failed_transfer_is_not_published_and_can_be_retried_from_zero()
+async fn failed_transfer_is_not_published_and_resumes_its_verified_prefix()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_directory, books, storage, downloader) = setup().await?;
     let (updates, _receiver) = progress();
@@ -168,7 +302,11 @@ async fn failed_transfer_is_not_published_and_can_be_retried_from_zero()
             .await,
         Err(DownloadError::Network)
     );
-    assert_eq!(std::fs::read_dir(&books)?.count(), 0);
+    assert_eq!(
+        std::fs::read_dir(&books)?.count(),
+        1,
+        "only a hidden partial file"
+    );
     let records = storage.list_downloads().await?;
     assert_eq!(records[0].status, DownloadStatus::Failed);
     assert_eq!(records[0].progress.downloaded_bytes(), 3);
@@ -259,6 +397,7 @@ async fn file_created_during_transfer_wins_without_clobbering()
     let path = books.join(safe_file_name(&attachment));
     let source = RemoteBook {
         book: attachment,
+        source_title: None,
         chunks: Box::new(RacingChunks {
             path: path.clone(),
             done: false,
@@ -305,6 +444,7 @@ async fn telemetry_ticks_while_waiting_without_restarting_the_in_flight_chunk()
     let calls = Arc::new(AtomicUsize::new(0));
     let source = RemoteBook {
         book: book("book.epub", Some(4)),
+        source_title: None,
         chunks: Box::new(GatedChunks {
             calls: calls.clone(),
             release: gate,
@@ -344,10 +484,14 @@ async fn telemetry_ticks_while_waiting_without_restarting_the_in_flight_chunk()
 #[tokio::test]
 async fn cancellation_interrupts_pending_chunks_and_cleans_the_temporary_file()
 -> Result<(), Box<dyn std::error::Error>> {
-    struct PendingChunks(Arc<tokio::sync::Notify>);
+    struct PendingChunks(Arc<tokio::sync::Notify>, bool);
     impl BookChunks for PendingChunks {
         fn next_chunk(&mut self) -> ChunkFuture<'_> {
             Box::pin(async {
+                if !self.1 {
+                    self.1 = true;
+                    return Ok(Some(b"a".to_vec()));
+                }
                 self.0.notify_one();
                 std::future::pending().await
             })
@@ -358,7 +502,8 @@ async fn cancellation_interrupts_pending_chunks_and_cleans_the_temporary_file()
     let started = Arc::new(tokio::sync::Notify::new());
     let source = RemoteBook {
         book: book("book.epub", Some(3)),
-        chunks: Box::new(PendingChunks(started.clone())),
+        source_title: None,
+        chunks: Box::new(PendingChunks(started.clone(), false)),
     };
     let cancellation = CancellationToken::new();
     let cancel = cancellation.clone();
@@ -380,12 +525,16 @@ async fn cancellation_interrupts_pending_chunks_and_cleans_the_temporary_file()
 }
 
 #[tokio::test]
-async fn aborted_worker_leaves_no_file_and_startup_recovery_marks_it_failed()
+async fn aborted_worker_retains_a_checkpoint_and_startup_recovery_marks_it_failed()
 -> Result<(), Box<dyn std::error::Error>> {
-    struct Blocked(Arc<tokio::sync::Notify>);
+    struct Blocked(Arc<tokio::sync::Notify>, bool);
     impl BookChunks for Blocked {
         fn next_chunk(&mut self) -> ChunkFuture<'_> {
             Box::pin(async {
+                if !self.1 {
+                    self.1 = true;
+                    return Ok(Some(b"abc".to_vec()));
+                }
                 self.0.notify_one();
                 std::future::pending().await
             })
@@ -396,8 +545,9 @@ async fn aborted_worker_leaves_no_file_and_startup_recovery_marks_it_failed()
     let (updates, _receiver) = progress();
     let started = Arc::new(tokio::sync::Notify::new());
     let source = RemoteBook {
-        book: book("book.epub", Some(3)),
-        chunks: Box::new(Blocked(started.clone())),
+        book: book("book.epub", Some(6)),
+        source_title: None,
+        chunks: Box::new(Blocked(started.clone(), false)),
     };
     let folder = books.clone();
     let job = tokio::spawn(async move {
@@ -408,7 +558,7 @@ async fn aborted_worker_leaves_no_file_and_startup_recovery_marks_it_failed()
     tokio::time::timeout(Duration::from_secs(1), started.notified()).await?;
     job.abort();
     assert!(job.await.is_err());
-    assert_eq!(std::fs::read_dir(books)?.count(), 0);
+    assert_eq!(std::fs::read_dir(&books)?.count(), 1);
     assert_eq!(
         storage.list_downloads().await?[0].status,
         DownloadStatus::Downloading
@@ -418,6 +568,18 @@ async fn aborted_worker_leaves_no_file_and_startup_recovery_marks_it_failed()
         storage.list_downloads().await?[0].status,
         DownloadStatus::Failed
     );
+    let record = storage.list_downloads().await?.remove(0);
+    let checkpoint = storage
+        .checkpoint(&record)
+        .await?
+        .ok_or("missing checkpoint")?;
+    assert_eq!(checkpoint.downloaded_bytes, 3);
+    let (source, _) = remote(book("book.epub", Some(6)), vec![Ok(b"abcdef".to_vec())]);
+    let (updates, _) = async_channel::unbounded();
+    let saved = recover
+        .save(source, books, updates, CancellationToken::new())
+        .await?;
+    assert_eq!(tokio::fs::read(saved.local_path).await?, b"abcdef");
     Ok(())
 }
 
@@ -427,6 +589,22 @@ async fn failure_after_publication_preserves_the_file_and_does_not_claim_success
     #[derive(Clone)]
     struct FailCompletion(Storage);
     impl DownloadRepository for FailCompletion {
+        async fn checkpoint(
+            &self,
+            record: &DownloadRecord,
+        ) -> Result<Option<tgbooks_core::DownloadCheckpoint>, DownloadError> {
+            self.0.checkpoint(record).await
+        }
+        async fn save_checkpoint(
+            &self,
+            record: &DownloadRecord,
+            checkpoint: &tgbooks_core::DownloadCheckpoint,
+        ) -> Result<(), DownloadError> {
+            self.0.save_checkpoint(record, checkpoint).await
+        }
+        async fn clear_checkpoint(&self, record: &DownloadRecord) -> Result<(), DownloadError> {
+            self.0.clear_checkpoint(record).await
+        }
         async fn claim(&self, record: &DownloadRecord) -> Result<bool, DownloadError> {
             self.0.claim(record).await
         }
@@ -449,15 +627,26 @@ async fn failure_after_publication_preserves_the_file_and_does_not_claim_success
     let (updates, _receiver) = progress();
     assert_eq!(
         downloader
-            .save(source, books, updates, CancellationToken::new())
+            .save(source, books.clone(), updates, CancellationToken::new())
             .await,
         Err(DownloadError::Storage)
     );
-    assert_eq!(tokio::fs::read(path).await?, b"abc");
+    assert_eq!(tokio::fs::read(&path).await?, b"abc");
     assert_eq!(
         storage.list_downloads().await?[0].status,
         DownloadStatus::Failed
     );
+    // Retry reconciles the published file rather than clobbering it or getting
+    // permanently stuck at FileExists after a completion-transaction failure.
+    let (source, calls) = remote(book("book.epub", Some(3)), vec![Ok(b"BAD".to_vec())]);
+    let (updates, _) = async_channel::unbounded();
+    let recovered = LocalDownloader::new(storage.clone())
+        .save(source, books, updates, CancellationToken::new())
+        .await?;
+    assert_eq!(recovered.status, DownloadStatus::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tokio::fs::read(path).await?, b"abc");
+    assert!(storage.checkpoint(&recovered).await?.is_none());
     Ok(())
 }
 

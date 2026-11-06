@@ -22,7 +22,7 @@ use tgbooks_core::SecretString;
 use unicode_segmentation::UnicodeSegmentation as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use super::theme::Theme;
+use super::{icons::Icon, theme::Theme};
 
 actions!(
     auth_input,
@@ -66,6 +66,7 @@ pub struct TextInput {
     label: &'static str,
     placeholder: &'static str,
     masked: bool,
+    compact: bool,
     selection: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
@@ -88,6 +89,7 @@ impl TextInput {
             label,
             placeholder,
             masked,
+            compact: false,
             selection: 0..0,
             reversed: false,
             marked: None,
@@ -100,6 +102,18 @@ impl TextInput {
 
     pub fn secret(&self) -> SecretString {
         SecretString::new(self.value.to_string())
+    }
+
+    pub fn search(label: &'static str, placeholder: &'static str, cx: &mut Context<Self>) -> Self {
+        Self {
+            compact: true,
+            ..Self::new(label, placeholder, false, cx)
+        }
+    }
+
+    /// Non-secret fields (local search) reuse the same native IME/editing code.
+    pub fn text(&self) -> &str {
+        &self.value
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -612,7 +626,7 @@ impl Render for TextInput {
             .key_context("AuthInput")
             .track_focus(&self.focus)
             .w_full()
-            .h(px(42.))
+            .h(px(if self.compact { 34. } else { 42. }))
             .p_2()
             .border_1()
             .border_color(theme.border)
@@ -643,7 +657,15 @@ impl Render for TextInput {
                 MouseButton::Left,
                 cx.listener(|input, _, _, _| input.selecting = false),
             )
-            .child(TextElement(cx.entity()))
+            .when(self.compact, |field| {
+                field
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(Icon::Search.element())
+            })
+            .child(div().w_full().min_w_0().child(TextElement(cx.entity())))
     }
 }
 

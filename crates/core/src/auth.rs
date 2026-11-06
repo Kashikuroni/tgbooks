@@ -90,9 +90,49 @@ pub struct AuthState {
     pub step: AuthStep,
     pub busy: bool,
     pub error: Option<AuthError>,
+    pub account: Option<AccountProfile>,
+}
+
+/// Display-only identity. Deliberately excludes the phone and redacts Debug.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct AccountProfile {
+    pub username: Option<String>,
+    pub name: String,
+}
+
+impl AccountProfile {
+    pub fn label(&self) -> String {
+        if let Some(username) = self
+            .username
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            format!("@{}", username.trim_start_matches('@'))
+        } else if !self.name.trim().is_empty() {
+            self.name.clone()
+        } else {
+            "Личный аккаунт".into()
+        }
+    }
+}
+
+impl fmt::Debug for AccountProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountProfile([REDACTED])")
+    }
 }
 
 pub trait Authentication: Send {
+    /// Verified/cached Telegram user ID, never a phone, credential or auth key.
+    /// Adapters without an identity cannot persist or restore download jobs.
+    fn account_id(&self) -> Option<i64> {
+        None
+    }
+
+    fn profile(&self) -> Option<AccountProfile> {
+        None
+    }
+
     fn execute(
         &mut self,
         action: AuthAction,
@@ -115,7 +155,19 @@ impl<A: Authentication> AuthController<A> {
     }
 
     pub fn state(&self) -> AuthState {
-        self.state.clone()
+        AuthState {
+            account: (self.state.step == AuthStep::Authorized)
+                .then(|| self.backend.profile())
+                .flatten(),
+            ..self.state.clone()
+        }
+    }
+
+    pub fn account_id(&self) -> Option<i64> {
+        (self.state.step == AuthStep::Authorized)
+            .then(|| self.backend.account_id())
+            .flatten()
+            .filter(|id| *id > 0)
     }
 
     pub fn backend_mut(&mut self) -> &mut A {
@@ -125,10 +177,11 @@ impl<A: Authentication> AuthController<A> {
     pub fn remaining_wait(&self) -> Option<u32> {
         self.retry_at
             .and_then(|time| time.checked_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
             .map(|remaining| {
                 remaining
                     .as_secs()
-                    .saturating_add(1)
+                    .saturating_add(u64::from(remaining.subsec_nanos() > 0))
                     .min(u64::from(u32::MAX)) as u32
             })
     }
@@ -249,6 +302,63 @@ mod tests {
 
     fn secret(text: &str) -> SecretString {
         SecretString::new(text.into())
+    }
+
+    #[test]
+    fn zero_flood_wait_is_already_expired_even_with_coarse_clock_ticks() {
+        let mut auth = AuthController::new(FakeAuth {
+            results: VecDeque::new(),
+            calls: 0,
+        });
+        for _ in 0..100 {
+            auth.record_flood_wait(0);
+            assert_eq!(auth.remaining_wait(), None);
+        }
+        auth.record_flood_wait(3);
+        assert!(auth.remaining_wait().is_some_and(|seconds| seconds <= 3));
+    }
+
+    #[test]
+    fn account_labels_prefer_username_without_exposing_identity_in_debug() {
+        let mut profile = AccountProfile {
+            username: Some("reader".into()),
+            name: "Иван Иванов".into(),
+        };
+        assert_eq!(profile.label(), "@reader");
+        assert_eq!(format!("{profile:?}"), "AccountProfile([REDACTED])");
+        profile.username = None;
+        assert_eq!(profile.label(), "Иван Иванов");
+        profile.name.clear();
+        assert_eq!(profile.label(), "Личный аккаунт");
+    }
+
+    #[tokio::test]
+    async fn profile_crosses_the_typed_boundary_only_while_authorized() {
+        struct ProfileAuth;
+        impl Authentication for ProfileAuth {
+            fn profile(&self) -> Option<AccountProfile> {
+                Some(AccountProfile {
+                    username: Some("reader".into()),
+                    name: "Reader".into(),
+                })
+            }
+            async fn execute(&mut self, _: AuthAction) -> Result<AuthStep, AuthFailure> {
+                Ok(AuthStep::Authorized)
+            }
+        }
+        let mut auth = AuthController::new(ProfileAuth);
+        assert!(auth.state().account.is_none());
+        let result = auth.execute(AuthAction::Restore).await;
+        auth.complete(result);
+        assert_eq!(
+            auth.state().account.map(|account| account.label()),
+            Some("@reader".into())
+        );
+        auth.complete(Err(AuthFailure {
+            kind: AuthError::Network,
+            step: AuthStep::Phone,
+        }));
+        assert!(auth.state().account.is_none());
     }
 
     async fn apply(controller: &mut AuthController<FakeAuth>, action: AuthAction) {

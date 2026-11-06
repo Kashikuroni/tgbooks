@@ -11,8 +11,8 @@ use grammers_client::{
     tl,
 };
 use tgbooks_core::{
-    BookAttachment, BookPage, CatalogError, ChannelCatalog, ChannelSummary, DownloadKey,
-    SCAN_PAGE_SIZE,
+    BookAttachment, BookPage, CatalogError, ChannelCatalog, ChannelSummary, DiscoveredBook,
+    DownloadKey, MonitorPage, SCAN_PAGE_SIZE,
 };
 
 use crate::TelegramAuth;
@@ -67,6 +67,30 @@ impl ChannelCatalog for TelegramAuth {
         channel_id: i64,
         before: Option<i32>,
     ) -> Result<BookPage, CatalogError> {
+        let page = self.read_updates(channel_id, before).await?;
+        Ok(BookPage {
+            books: page.books.into_iter().map(|found| found.book).collect(),
+            scanned: page.scanned,
+            skipped_protected: page.skipped_protected,
+            next_offset: page.next_offset,
+        })
+    }
+
+    async fn scan_updates(
+        &mut self,
+        channel_id: i64,
+        before: Option<i32>,
+    ) -> Result<MonitorPage, CatalogError> {
+        self.read_updates(channel_id, before).await
+    }
+}
+
+impl TelegramAuth {
+    async fn read_updates(
+        &mut self,
+        channel_id: i64,
+        before: Option<i32>,
+    ) -> Result<MonitorPage, CatalogError> {
         let client = self.catalog_client()?;
         let reference = self
             .channels
@@ -95,11 +119,13 @@ impl ChannelCatalog for TelegramAuth {
                 let mut scanned = 0;
                 let mut skipped_protected = 0;
                 let mut oldest: Option<i32> = None;
+                let mut newest: Option<i32> = None;
                 while let Some(message) = messages.next().await.map_err(map_error)? {
                     scanned += 1;
                     let id = message.id();
                     if id > 0 {
                         oldest = Some(oldest.map_or(id, |old| old.min(id)));
+                        newest = Some(newest.map_or(id, |new| new.max(id)));
                     }
                     if is_protected(&message) {
                         skipped_protected += 1;
@@ -121,7 +147,10 @@ impl ChannelCatalog for TelegramAuth {
                         document.size().and_then(|size| u64::try_from(size).ok()),
                         false,
                     ) {
-                        books.push(book);
+                        books.push(DiscoveredBook {
+                            book,
+                            message_date: message.date().as_second(),
+                        });
                     }
                 }
                 let next_offset = if scanned as usize == SCAN_PAGE_SIZE {
@@ -129,10 +158,11 @@ impl ChannelCatalog for TelegramAuth {
                 } else {
                     None
                 };
-                Ok(BookPage {
+                Ok(MonitorPage {
                     books,
                     scanned,
                     skipped_protected,
+                    newest,
                     next_offset,
                 })
             },
@@ -201,6 +231,10 @@ mod tests {
         );
         assert_eq!(
             backend.scan_books(-1000000000001, None).await,
+            Err(CatalogError::Unauthorized)
+        );
+        assert_eq!(
+            backend.scan_updates(-1000000000001, None).await,
             Err(CatalogError::Unauthorized)
         );
         assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);

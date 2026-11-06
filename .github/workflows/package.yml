@@ -1,0 +1,70 @@
+name: Test packages
+
+# Candidate branches can be tested before creating an immutable version tag.
+# This workflow builds artifacts only; it never publishes a GitHub Release.
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches: ['release/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package / ${{ matrix.family }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            family: macos
+          - os: windows-2022
+            family: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run Rust and GPUI tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Install pinned cargo-packager locally
+        run: cargo xtask install-tools
+
+      - name: Build native release package
+        run: cargo xtask package
+
+      # Upload archives/installers, not raw .app directories: artifact ZIPs lose
+      # executable permissions. No user data directories or source tree uploads.
+      - name: Upload test package and checksum
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tgbooks-test-${{ matrix.family }}
+          path: target/packages/${{ matrix.family }}/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

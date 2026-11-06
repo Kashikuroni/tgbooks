@@ -1,7 +1,7 @@
 use gpui::{Hsla, rgb};
 
 pub const TOOLBAR_HEIGHT: f32 = 44.;
-pub const SIDEBAR_WIDTH: f32 = 240.;
+pub const SIDEBAR_WIDTH: f32 = 224.;
 
 /// Neutral graphite surfaces, matching the supplied Delta reference.
 pub struct Theme {
@@ -13,6 +13,12 @@ pub struct Theme {
     pub selected: Hsla,
     pub border: Hsla,
     pub error: Hsla,
+    pub success: Hsla,
+    pub warning: Hsla,
+    pub selection: Hsla,
+    pub switch_on: Hsla,
+    pub switch_off: Hsla,
+    pub switch_thumb: Hsla,
 }
 
 impl Theme {
@@ -26,6 +32,12 @@ impl Theme {
             selected: rgb(0x2c2e32).into(),
             border: rgb(0x303236).into(),
             error: rgb(0xf29b9b).into(),
+            success: rgb(0x9bbb9e).into(),
+            warning: rgb(0xd6ae76).into(),
+            selection: rgb(0x252d38).into(),
+            switch_on: rgb(0x3478f6).into(),
+            switch_off: rgb(0x6b6e76).into(),
+            switch_thumb: rgb(0xffffff).into(),
         }
     }
 }
@@ -54,10 +66,25 @@ mod tests {
     }
 
     #[test]
+    fn switch_track_and_thumb_have_non_text_contrast_in_both_states() {
+        let theme = Theme::dark();
+        for track in [theme.switch_on, theme.switch_off] {
+            assert!(contrast(track, theme.canvas) >= 3.);
+            assert!(contrast(theme.switch_thumb, track) >= 3.);
+        }
+    }
+
+    #[test]
     fn dark_text_and_focus_meet_contrast_requirements_on_every_surface() {
         let theme = Theme::dark();
-        for surface in [theme.canvas, theme.sidebar, theme.selected] {
-            for foreground in [theme.text, theme.muted, theme.error] {
+        for surface in [theme.canvas, theme.sidebar, theme.selected, theme.selection] {
+            for foreground in [
+                theme.text,
+                theme.muted,
+                theme.error,
+                theme.success,
+                theme.warning,
+            ] {
                 assert!(contrast(foreground, surface) >= 4.5);
             }
             assert!(contrast(theme.accent, surface) >= 3.);

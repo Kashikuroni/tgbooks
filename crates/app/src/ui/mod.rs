@@ -2,10 +2,17 @@ mod channels;
 mod chrome;
 mod components;
 mod downloads;
+mod files;
 mod icons;
 mod input;
+mod install;
+mod library;
 mod login;
 mod metrics;
+mod notifications;
+mod recommendations;
+mod select;
+mod settings;
 mod theme;
 
 #[cfg(feature = "gpui-tests")]
@@ -20,12 +27,12 @@ use gpui::{
     Role, SharedString, Task, Window, actions, div, prelude::*, px, size,
 };
 use tgbooks_core::{
-    AppInfo, AuthState, AuthStep, BookFormat, CatalogState, CoreCommand, CoreEvent, DownloadRecord,
+    AppInfo, AuthState, AuthStep, CatalogState, CoreCommand, CoreEvent, DownloadRecord,
     DownloadStatus, ServiceFailure, TransferState, UiConnection,
 };
 
 use crate::platform;
-use components::{button, icon_button, navigation_button, setting};
+use components::{button, icon_button, navigation_button};
 use icons::{Icon, IconAssets};
 use theme::{SIDEBAR_WIDTH, Theme};
 
@@ -95,12 +102,18 @@ impl Screen {
     }
 }
 
-pub fn run(connection: UiConnection, shutdown: impl Future<Output = ()> + 'static) -> Result<()> {
+pub fn run(
+    connection: UiConnection,
+    shutdown: impl Future<Output = ()> + 'static,
+    start: Sender<()>,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let window_error = Rc::new(Cell::new(None));
     let error = window_error.clone();
     gpui_platform::application()
         .with_assets(IconAssets)
         .run(move |cx: &mut App| {
+            cx.set_app_identity(platform::APP_ID, platform::APP_NAME);
             tracing::info!("opening native window");
             let mut shutdown = Some(shutdown);
             cx.on_app_quit(move |_| {
@@ -122,20 +135,31 @@ pub fn run(connection: UiConnection, shutdown: impl Future<Output = ()> + 'stati
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(1040.), px(700.)), cx);
-            if let Err(failure) =
-                cx.open_window(platform::window_options(bounds), move |window, cx| {
+            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            let window =
+                match cx.open_window(platform::window_options(bounds), move |window, cx| {
                     let view = cx.new(|cx| BookApp::new(connection, cx));
                     view.read(cx).focus_handle.clone().focus(window, cx);
                     view
-                })
-            {
-                error.set(Some(failure));
-                cx.quit();
-                return;
-            }
+                }) {
+                    Ok(window) => window,
+                    Err(failure) => {
+                        error.set(Some(failure));
+                        cx.quit();
+                        return;
+                    }
+                };
+            let available = platform::notification_support(cx);
+            let _ = window.update(cx, |app, _, cx| {
+                app.notification_available = available;
+                app.preferences.update(cx, |view, cx| {
+                    view.set_notification_available(available, cx)
+                });
+            });
+            notifications::register(window, cx);
             cx.activate(true);
             tracing::info!("native window ready");
+            install::offer(window, start, runtime, cx);
         });
     match window_error.take() {
         Some(error) => Err(error).context("could not open the native window"),
@@ -182,6 +206,21 @@ struct BookApp {
     authentication: AuthState,
     login: gpui::Entity<login::LoginForm>,
     catalog: gpui::Entity<channels::CatalogView>,
+    library: gpui::Entity<library::FileTable>,
+    history: gpui::Entity<library::FileTable>,
+    preferences: gpui::Entity<settings::SettingsView>,
+    recommendations: gpui::Entity<recommendations::RecommendationsView>,
+    show_recommendations: bool,
+    _recommendation_events: gpui::Subscription,
+    _catalog_events: gpui::Subscription,
+    notifications: notifications::Notifications,
+    notification_timer: Option<Task<()>>,
+    notification_window: Option<gpui::WindowHandle<BookApp>>,
+    notification_available: bool,
+    _notification_test_events: gpui::Subscription,
+    show_history: bool,
+    _library_events: gpui::Subscription,
+    _history_events: gpui::Subscription,
     _events: Task<()>,
 }
 
@@ -225,6 +264,11 @@ impl BookApp {
                     ..Default::default()
                 };
                 view.metrics = None;
+                view.notification_account(None, cx);
+                view.preferences.update(cx, |view, cx| view.stop(cx));
+                view.recommendations
+                    .update(cx, |view, cx| view.set_state(Default::default(), cx));
+                view.sync_file_tables(cx);
                 cx.notify();
             });
         });
@@ -242,6 +286,36 @@ impl BookApp {
             ),
         ]
         .into();
+        let library = cx.new(|cx| library::FileTable::new(false, cx));
+        let history = cx.new(|cx| library::FileTable::new(true, cx));
+        let library_events = cx.subscribe(&library, |app, _, _: &library::GoToChannels, cx| {
+            app.navigate(Screen::Channels, cx)
+        });
+        let history_events = cx.subscribe(&history, |app, _, _: &library::GoToChannels, cx| {
+            app.navigate(Screen::Channels, cx)
+        });
+        let recommendations =
+            cx.new(|cx| recommendations::RecommendationsView::new(connection.commands.clone(), cx));
+        let catalog = cx.new(|cx| channels::CatalogView::new(connection.commands.clone(), cx));
+        let preferences = cx.new(|cx| settings::SettingsView::new(connection.commands.clone(), cx));
+        let notification_test_events = cx.subscribe(
+            &preferences,
+            |app, _, _: &settings::TestNotification, cx| app.test_notification(cx),
+        );
+        let catalog_events =
+            cx.subscribe(&catalog, |app, _, _: &channels::OpenRecommendations, cx| {
+                app.show_recommendations = true;
+                cx.notify();
+            });
+        let recommendation_events = cx.subscribe(
+            &recommendations,
+            |app, _, event: &recommendations::GoToSource, cx| {
+                app.show_recommendations = false;
+                app.navigate(Screen::Channels, cx);
+                app.catalog
+                    .update(cx, |catalog, cx| catalog.select(Some(event.0), cx));
+            },
+        );
         Self {
             screen: Screen::default(),
             focus_handle: cx.focus_handle(),
@@ -264,21 +338,77 @@ impl BookApp {
                 ..Default::default()
             },
             login: cx.new(|cx| login::LoginForm::new(connection.commands.clone(), cx)),
-            catalog: cx.new(|cx| channels::CatalogView::new(connection.commands, cx)),
+            preferences,
+            catalog,
+            library,
+            history,
+            show_history: false,
+            recommendations,
+            show_recommendations: false,
+            _recommendation_events: recommendation_events,
+            _catalog_events: catalog_events,
+            notifications: notifications::Notifications::default(),
+            notification_timer: None,
+            notification_window: None,
+            notification_available: false,
+            _notification_test_events: notification_test_events,
+            _library_events: library_events,
+            _history_events: history_events,
             _events: task,
         }
     }
 
     fn apply_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
-            CoreEvent::Ready(info) => self.info = Some(info),
+            CoreEvent::RecommendationBatch(batch) => self.queue_notification(batch, cx),
+            CoreEvent::RecommendationActionFinished => {
+                self.recommendations
+                    .update(cx, |view, cx| view.finish_command(cx));
+            }
+            CoreEvent::Recommendations(state) => {
+                self.notification_account(state.account, cx);
+                self.recommendations
+                    .update(cx, |view, cx| view.set_state(state, cx));
+            }
+            CoreEvent::Ready(info) => {
+                self.preferences.update(cx, |view, cx| {
+                    view.initialize(info.settings.clone(), info.data_directory.clone(), cx)
+                });
+                self.catalog.update(cx, |view, cx| {
+                    view.set_download_directory(info.settings.download_directory.clone(), cx)
+                });
+                self.info = Some(info);
+            }
+            CoreEvent::SettingsSaved(result) => {
+                if let Ok(settings) = &result {
+                    if !settings.system_notifications {
+                        self.clear_notifications(cx);
+                    }
+                    if let Some(info) = &mut self.info {
+                        info.settings = settings.clone();
+                    }
+                    self.catalog.update(cx, |view, cx| {
+                        view.set_download_directory(settings.download_directory.clone(), cx)
+                    });
+                }
+                self.preferences
+                    .update(cx, |view, cx| view.complete(result, cx));
+            }
+            CoreEvent::SourceSaved(result) => {
+                self.catalog
+                    .update(cx, |catalog, cx| catalog.complete_source(result, cx));
+            }
             CoreEvent::HistoryLoaded(records) => {
                 self.records = records;
                 self.sync_download_controls(cx);
                 self.loading = false;
                 self.notice = None;
+                self.sync_file_tables(cx);
             }
             CoreEvent::Authentication(state) => {
+                if state.busy || state.step != AuthStep::Authorized {
+                    self.notification_account(None, cx);
+                }
                 if state.step == AuthStep::Authorized
                     && self.authentication.step != AuthStep::Authorized
                 {
@@ -287,14 +417,20 @@ impl BookApp {
                     self.catalog.update(cx, |catalog, cx| {
                         catalog.set_state(CatalogState::default(), cx)
                     });
+                    self.recommendations
+                        .update(cx, |view, cx| view.set_state(Default::default(), cx));
                 }
                 self.login
                     .update(cx, |form, cx| form.set_state(state.clone(), cx));
                 self.authentication = state;
             }
-            CoreEvent::Catalog(state) => self
-                .catalog
-                .update(cx, |catalog, cx| catalog.set_state(state, cx)),
+            CoreEvent::Catalog(state) => {
+                self.notification_account(state.sources.account, cx);
+                self.recommendations
+                    .update(cx, |view, cx| view.set_catalog(&state, cx));
+                self.catalog
+                    .update(cx, |catalog, cx| catalog.set_state(state, cx));
+            }
             CoreEvent::DownloadState(state) => {
                 if state.active != self.transfer.active || state.cancelling {
                     self.metrics = None;
@@ -306,32 +442,41 @@ impl BookApp {
                     && (state.error != self.transfer.error
                         || state.error_file != self.transfer.error_file);
                 if first_job || new_error {
+                    self.show_history = false;
                     self.navigate(Screen::Downloads, cx);
                     self.focus_download = first_job;
                 }
                 self.catalog
                     .update(cx, |catalog, cx| catalog.set_transfer(state.clone(), cx));
                 self.transfer = state;
+                self.recommendations.update(cx, |view, cx| {
+                    view.set_downloads(&self.records, &self.transfer, cx)
+                });
                 self.sync_download_controls(cx);
             }
             CoreEvent::DownloadUpdated(record) => {
                 let completed = record.status == DownloadStatus::Completed;
+                let terminal = matches!(
+                    record.status,
+                    DownloadStatus::Completed | DownloadStatus::Failed
+                );
                 if record.status != DownloadStatus::Downloading
                     && self.metrics.is_some_and(|(key, _)| key == record.key)
                 {
                     self.metrics = None;
                 }
-                if let Some(existing) = self
-                    .records
-                    .iter_mut()
-                    .find(|existing| existing.key == record.key)
-                {
+                if let Some(existing) = self.records.iter_mut().find(|existing| {
+                    existing.key == record.key && existing.local_path == record.local_path
+                }) {
                     *existing = record;
                 } else {
                     self.records.insert(0, record);
                 }
                 if completed {
                     self.sync_download_controls(cx);
+                }
+                if terminal {
+                    self.sync_file_tables(cx);
                 }
             }
             CoreEvent::DownloadMetrics { key, metrics } => {
@@ -376,8 +521,16 @@ impl BookApp {
                         "Не удалось прочитать или обновить историю. Проверьте доступ к SQLite и повторите обновление."
                     }
                 });
+                self.sync_file_tables(cx);
             }
         }
+        self.sync_recommendation_count(cx);
+    }
+
+    fn sync_recommendation_count(&self, cx: &mut Context<Self>) {
+        let unread = self.recommendations.read(cx).unread_count();
+        self.catalog
+            .update(cx, |view, cx| view.set_recommendation_count(unread, cx));
     }
 
     fn sync_download_controls(&mut self, cx: &mut Context<Self>) {
@@ -389,12 +542,6 @@ impl BookApp {
                 .iter()
                 .map(|job| Control::Waiting(job.book.key)),
         );
-        wanted.extend(
-            self.records
-                .iter()
-                .filter(|record| record.status == DownloadStatus::Completed)
-                .map(|record| Control::Reveal(record.key)),
-        );
         self.download_controls.retain(|id, _| wanted.contains(id));
         for id in wanted {
             self.download_controls.entry(id).or_insert_with(|| {
@@ -404,6 +551,21 @@ impl BookApp {
                 )
             });
         }
+    }
+
+    fn sync_file_tables(&mut self, cx: &mut Context<Self>) {
+        self.recommendations.update(cx, |view, cx| {
+            view.set_downloads(&self.records, &self.transfer, cx)
+        });
+        self.library.update(cx, |view, cx| {
+            view.set_records(&self.records, self.loading, cx)
+        });
+        self.history.update(cx, |view, cx| {
+            view.set_records(&self.records, self.loading, cx)
+        });
+        self.catalog
+            .update(cx, |view, cx| view.set_history(&self.records, cx));
+        self.sync_recommendation_count(cx);
     }
 
     fn navigate(&mut self, screen: Screen, cx: &mut Context<Self>) {
@@ -442,7 +604,11 @@ impl BookApp {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.screen == Screen::Channels {
-            self.catalog.update(cx, |catalog, cx| catalog.refresh(cx));
+            if self.show_recommendations {
+                self.recommendations.update(cx, |view, cx| view.refresh(cx));
+            } else {
+                self.catalog.update(cx, |catalog, cx| catalog.refresh(cx));
+            }
             cx.notify();
             return;
         }
@@ -505,6 +671,9 @@ impl BookApp {
     }
 
     fn refresh_control(&self, cx: &Context<Self>) -> AnyElement {
+        if self.screen == Screen::Settings {
+            return div().into_any_element();
+        }
         let loading = if self.screen == Screen::Channels {
             self.catalog.read(cx).busy()
         } else {
@@ -531,24 +700,48 @@ impl BookApp {
         if self.screen == Screen::Channels && self.authentication.step != AuthStep::Authorized {
             return div().into_any_element();
         }
-        button("refresh", "Обновить")
-            .text_sm()
-            .on_click(cx.listener(|view, _, _, cx| view.refresh(cx)))
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
-                if is_activation_key(event) {
-                    view.refresh(cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .into_any_element()
+        button(
+            "refresh",
+            if self.screen == Screen::Channels {
+                "Обновить каналы"
+            } else {
+                "Обновить"
+            },
+        )
+        .text_sm()
+        .on_click(cx.listener(|view, _, _, cx| view.refresh(cx)))
+        .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+            if is_activation_key(event) {
+                view.refresh(cx);
+                cx.stop_propagation();
+            }
+        }))
+        .into_any_element()
     }
 
-    fn sidebar(&self, cx: &Context<Self>) -> Div {
+    fn recommendation_controls(&self, cx: &Context<Self>) -> Div {
+        div().flex().flex_wrap().items_center().gap_2().child(
+            button("back-to-channels", "К каналам")
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.show_recommendations = false;
+                    cx.notify();
+                }))
+                .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+                    if is_activation_key(event) {
+                        view.show_recommendations = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                })),
+        )
+    }
+
+    fn sidebar(&self, compact: bool, cx: &Context<Self>) -> Div {
         let theme = Theme::dark();
         div()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(if compact { 208. } else { SIDEBAR_WIDTH }))
             .flex_shrink_0()
             .h_full()
             .bg(theme.sidebar)
@@ -556,85 +749,160 @@ impl BookApp {
             .border_color(theme.border)
             .child(
                 div()
-                    .px_3()
-                    .pt_4()
-                    .pb_2()
-                    .text_sm()
-                    .text_color(theme.muted)
-                    .child("Библиотека"),
+                    .px_5()
+                    .h(px(64.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::Library.element())
+                    .child("Telegram Books"),
             )
-            .child(div().flex().flex_col().px_2().gap_1().children(
-                Screen::ALL.into_iter().enumerate().map(|(index, screen)| {
-                    let selected = self.screen == screen;
-                    navigation_button(("navigation", index), screen.label(), screen.icon())
-                        .aria_selected(selected)
-                        .when(selected, |style| {
-                            style
-                                .bg(theme.selected)
-                                .font_weight(gpui::FontWeight::MEDIUM)
+            .child(
+                div().flex().flex_col().px_2().gap_1().children(
+                    Screen::ALL
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, screen)| {
+                            matches!(
+                                screen,
+                                Screen::Channels | Screen::Downloads | Screen::Library
+                            )
                         })
-                        .on_click(cx.listener(move |view, _, _, cx| view.navigate(screen, cx)))
-                        .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
-                            if is_activation_key(event) {
-                                view.navigate(screen, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                }),
-            ))
+                        .map(|(index, screen)| {
+                            let selected = self.screen == screen;
+                            navigation_button(("navigation", index), screen.label(), screen.icon())
+                                .aria_selected(selected)
+                                .when(
+                                    screen == Screen::Channels
+                                        && self.recommendations.read(cx).unread_count() > 0,
+                                    |row| {
+                                        let unread = self.recommendations.read(cx).unread_count();
+                                        row.aria_label(format!("Каналы, новых книг: {unread}"))
+                                            .child(div().flex_1())
+                                            .child(div().text_sm().px_2().child(unread.to_string()))
+                                    },
+                                )
+                                .when(selected, |style| {
+                                    style
+                                        .bg(theme.selected)
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                })
+                                .when(
+                                    screen == Screen::Downloads
+                                        && (self.transfer.active.is_some()
+                                            || !self.transfer.queued.is_empty()),
+                                    |row| {
+                                        row.child(div().flex_1()).child(
+                                            div()
+                                                .px_2()
+                                                .rounded_sm()
+                                                .bg(theme.selected)
+                                                .text_sm()
+                                                .child(
+                                                    (self.transfer.queued.len()
+                                                        + usize::from(
+                                                            self.transfer.active.is_some(),
+                                                        ))
+                                                    .to_string(),
+                                                ),
+                                        )
+                                    },
+                                )
+                                .on_click(
+                                    cx.listener(move |view, _, _, cx| view.navigate(screen, cx)),
+                                )
+                                .on_key_down(cx.listener(
+                                    move |view, event: &KeyDownEvent, _, cx| {
+                                        if is_activation_key(event) {
+                                            view.navigate(screen, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                        }),
+                ),
+            )
             .child(div().flex_1())
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_3()
-                    .py_4()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_sm()
-                    .child("Telegram Books")
-                    .text_color(theme.muted)
-                    .child(if self.authentication.busy {
-                        "Проверяем Telegram…"
-                    } else if self.authentication.step == AuthStep::Authorized {
-                        "Telegram подключён"
-                    } else {
-                        "Telegram не подключён"
-                    }),
+                div().px_2().pb_3().child(
+                    navigation_button("nav-settings", "Настройки", Icon::Settings)
+                        .when(self.screen == Screen::Settings, |row| {
+                            row.bg(theme.selected)
+                        })
+                        .on_click(cx.listener(|app, _, _, cx| app.navigate(Screen::Settings, cx)))
+                        .on_key_down(cx.listener(|app, event: &KeyDownEvent, _, cx| {
+                            if is_activation_key(event) {
+                                app.navigate(Screen::Settings, cx);
+                                cx.stop_propagation();
+                            }
+                        })),
+                ),
+            )
+            .child(
+                icon_button("nav-account", "Telegram-аккаунт", Icon::Account)
+                    .w_full()
+                    .h_auto()
+                    .px_4()
+                    .py_3()
+                    .border_color(theme.sidebar)
+                    .rounded_none()
+                    .justify_start()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .child(div().truncate().child(
+                                self.authentication.account.as_ref().map_or_else(
+                                    || {
+                                        if self.authentication.step == AuthStep::Authorized {
+                                            "Личный аккаунт".into()
+                                        } else {
+                                            "Подключить Telegram".into()
+                                        }
+                                    },
+                                    tgbooks_core::AccountProfile::label,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child(if self.authentication.busy {
+                                        "Проверяем Telegram…"
+                                    } else if self.authentication.step == AuthStep::Authorized {
+                                        "Telegram подключён"
+                                    } else {
+                                        "Telegram не подключён"
+                                    }),
+                            ),
+                    )
+                    .on_click(cx.listener(|app, _, _, cx| app.navigate(Screen::Login, cx)))
+                    .on_key_down(cx.listener(|app, event: &KeyDownEvent, _, cx| {
+                        if is_activation_key(event) {
+                            app.navigate(Screen::Login, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
             )
     }
 
     fn content(&self, cx: &Context<Self>) -> Div {
         match self.screen {
             Screen::Login => div().h_full().min_h_0().child(self.login.clone()),
-            Screen::Channels => div().h_full().min_h_0().child(self.catalog.clone()),
-            Screen::Downloads | Screen::Library => downloads::render(self, cx),
-            Screen::Settings => {
-                let mut settings = div().flex().flex_col();
-                if let Some(info) = &self.info {
-                    settings = settings
-                        .child(setting("Директория данных", info.data_directory.clone()))
-                        .child(setting(
-                            "Рабочая директория книг",
-                            info.download_directory.clone(),
-                        ));
-                }
-                settings
-                    .child(setting(
-                        "Форматы книг",
-                        BookFormat::ALL
-                            .map(|format| format.extension().to_uppercase())
-                            .join(", "),
-                    ))
-                    .child(setting("Тема", "Тёмная, в стиле Delta"))
-                    .child(
-                        div()
-                            .pt_6()
-                            .text_color(Theme::dark().muted)
-                            .child("Папка сохранения выбирается для каждой добавляемой группы книг. Очередь скачивает по одному файлу. Фактический путь остаётся в истории; эти параметры пока доступны только для просмотра."),
-                    )
+            Screen::Channels if self.show_recommendations => {
+                div().h_full().min_h_0().child(self.recommendations.clone())
             }
+            Screen::Channels => div().h_full().min_h_0().child(self.catalog.clone()),
+            Screen::Downloads if self.show_history => {
+                div().h_full().min_h_0().child(self.history.clone())
+            }
+            Screen::Downloads => downloads::render(self, cx),
+            Screen::Library => div().h_full().min_h_0().child(self.library.clone()),
+            Screen::Settings => div().h_full().min_h_0().child(self.preferences.clone()),
         }
     }
 }
@@ -645,6 +913,7 @@ fn is_activation_key(event: &KeyDownEvent) -> bool {
 
 impl Render for BookApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.notification_window = window.window_handle().downcast::<Self>();
         for control in self.download_controls.values_mut() {
             control.observe(window, cx);
         }
@@ -664,13 +933,26 @@ impl Render for BookApp {
             self.focus_download = false;
         }
         let theme = Theme::dark();
+        let short = window.viewport_size().height < px(620.);
         div()
             .id("application")
             .role(Role::Application)
             .aria_label("Telegram Books")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &FocusNext, window, cx| window.focus_next(cx)))
-            .on_action(cx.listener(|_, _: &FocusPrevious, window, cx| window.focus_prev(cx)))
+            .on_action(cx.listener(|view, _: &FocusNext, window, cx| {
+                window.focus_next(cx);
+                if view.screen == Screen::Settings {
+                    view.preferences
+                        .update(cx, |view, cx| view.reveal_focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|view, _: &FocusPrevious, window, cx| {
+                window.focus_prev(cx);
+                if view.screen == Screen::Settings {
+                    view.preferences
+                        .update(cx, |view, cx| view.reveal_focus(window, cx));
+                }
+            }))
             .on_action(cx.listener(|view, _: &Login, _, cx| view.navigate(Screen::Login, cx)))
             .on_action(cx.listener(|view, _: &Channels, _, cx| view.navigate(Screen::Channels, cx)))
             .on_action(
@@ -695,7 +977,9 @@ impl Render for BookApp {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .when(self.sidebar_open, |body| body.child(self.sidebar(cx)))
+                    .when(self.sidebar_open, |body| {
+                        body.child(self.sidebar(window.viewport_size().width < px(1100.), cx))
+                    })
                     .child(
                         div()
                             .flex()
@@ -703,48 +987,112 @@ impl Render for BookApp {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .p_6()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_4()
-                                    .child(
+                            .p(px(if short { 16. } else { 24. }))
+                            .gap(px(if short { 12. } else { 16. }))
+                            .when(
+                                self.screen != Screen::Channels || self.show_recommendations,
+                                |body| {
+                                    body.child(
                                         div()
                                             .flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex_col()
-                                            .gap_2()
+                                            .items_center()
+                                            .justify_between()
+                                            .flex_shrink_0()
+                                            .gap_4()
                                             .child(
                                                 div()
-                                                    .id("screen-title")
-                                                    .role(Role::Heading)
-                                                    .aria_level(1)
-                                                    .aria_label(self.screen.label())
-                                                    .text_xl()
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .child(self.screen.label()),
+                                                    .flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .flex_col()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .id("screen-title")
+                                                            .role(Role::Heading)
+                                                            .aria_level(1)
+                                                            .aria_label(
+                                                                if self.screen == Screen::Channels
+                                                                    && self.show_recommendations
+                                                                {
+                                                                    "Новые книги"
+                                                                } else {
+                                                                    self.screen.label()
+                                                                },
+                                                            )
+                                                            .text_xl()
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .child(
+                                                                if self.screen == Screen::Channels
+                                                                    && self.show_recommendations
+                                                                {
+                                                                    "Новые книги"
+                                                                } else {
+                                                                    self.screen.label()
+                                                                },
+                                                            ),
+                                                    )
+                                                    .when(!short, |heading| {
+                                                        heading.child(
+                                                    div().text_sm().text_color(theme.muted).child(
+                                                        match self.screen {
+                                                            Screen::Channels
+                                                                if self.show_recommendations =>
+                                                            {
+                                                                format!(
+                                                                    "Непросмотренных находок: {}",
+                                                                    self.recommendations
+                                                                        .read(cx)
+                                                                        .unread_count()
+                                                                )
+                                                            }
+                                                            Screen::Downloads => {
+                                                                "Скачивание по одному файлу".into()
+                                                            }
+                                                            Screen::Library => format!(
+                                                                "Файлов на этом устройстве: {}",
+                                                                self.records
+                                                                    .iter()
+                                                                    .filter(|record| {
+                                                                        record.status
+                                                                    == DownloadStatus::Completed
+                                                                    })
+                                                                    .count()
+                                                            ),
+                                                            _ => self.screen.description().into(),
+                                                        },
+                                                    ),
+                                                )
+                                                    }),
                                             )
-                                            .child(
-                                                div()
-                                                    .text_color(theme.muted)
-                                                    .child(self.screen.description()),
-                                            ),
+                                            .child(if self.screen == Screen::Channels {
+                                                self.recommendation_controls(cx).into_any_element()
+                                            } else if self.screen == Screen::Downloads
+                                                && !self.show_history
+                                            {
+                                                downloads::queue_control(self, cx)
+                                            } else {
+                                                self.refresh_control(cx)
+                                            }),
                                     )
-                                    .child(self.refresh_control(cx)),
+                                },
                             )
+                            .when(self.screen == Screen::Downloads, |body| {
+                                body.child(downloads::tabs(self, cx))
+                            })
                             .child(
                                 div()
                                     .id("screen-content")
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
+                                    .overflow_hidden()
                                     .when(
-                                        matches!(self.screen, Screen::Downloads | Screen::Library),
-                                        |content| content.track_scroll(&self.download_scroll),
+                                        self.screen == Screen::Downloads && !self.show_history,
+                                        |content| {
+                                            content
+                                                .overflow_y_scroll()
+                                                .track_scroll(&self.download_scroll)
+                                        },
                                     )
                                     .child(self.content(cx)),
                             )
@@ -752,8 +1100,8 @@ impl Render for BookApp {
                                 div()
                                     .border_t_1()
                                     .border_color(theme.border)
-                                    .pt_4()
-                                    .text_sm()
+                                    .pt_2()
+                                    .text_size(px(11.))
                                     .text_color(if self.notice.is_some() {
                                         theme.error
                                     } else {
@@ -763,7 +1111,7 @@ impl Render for BookApp {
                                         if self.loading {
                                             "Обновляем локальные данные…"
                                         } else {
-                                            "Локальное хранилище готово"
+                                            "Все данные хранятся на этом устройстве"
                                         },
                                     ))),
                             ),
@@ -775,6 +1123,7 @@ impl Render for BookApp {
 #[cfg(all(test, feature = "gpui-tests"))]
 mod tests {
     use gpui::TestAppContext;
+    use tgbooks_core::BookFormat;
 
     use super::*;
 
@@ -795,6 +1144,86 @@ mod tests {
             backend.commands.try_recv(),
             Ok(CoreCommand::RefreshHistory)
         ));
+    }
+
+    #[gpui::test]
+    fn channel_actions_align_with_the_title_without_a_separate_page_header(
+        cx: &mut TestAppContext,
+    ) {
+        for (width, height) in [(1280., 800.), (760., 520.)] {
+            for selected in [true, false] {
+                let (ui, backend) = tgbooks_core::connect();
+                let window = cx.open_window(size(px(width), px(height)), |_, cx| {
+                    let mut app = BookApp::new(ui, cx);
+                    app.apply_event(
+                        CoreEvent::Authentication(AuthState {
+                            step: AuthStep::Authorized,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    app.apply_event(
+                        CoreEvent::Catalog(CatalogState {
+                            authenticated: true,
+                            channels: vec![tgbooks_core::ChannelSummary {
+                                id: -1,
+                                title: "Physics.Math.Code".into(),
+                                username: Some("physics_lib".into()),
+                                protected: false,
+                            }],
+                            selected: selected.then_some(-1),
+                            sources: tgbooks_core::SavedSources {
+                                account: Some(1),
+                                loaded: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    app
+                });
+                let Ok(app) = window.root(cx) else {
+                    panic!("window missing");
+                };
+                let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+                visual.update(|window, _| window.activate_window());
+                visual.run_until_parked();
+                let Some(title) = visual.debug_bounds(if selected {
+                    "channel-title"
+                } else {
+                    "channel-overview-title"
+                }) else {
+                    panic!("title missing");
+                };
+                let Some(new_books) = visual.debug_bounds("catalog-new-books") else {
+                    panic!("new books action missing");
+                };
+                let Some(refresh) = visual.debug_bounds("catalog-refresh") else {
+                    panic!("refresh action missing");
+                };
+                assert!((new_books.center().y - title.center().y).abs() <= px(1.));
+                assert!((refresh.center().y - title.center().y).abs() <= px(1.));
+                assert!(
+                    title.top() < px(90.),
+                    "a separate header still pushes content down: {title:?}"
+                );
+                assert!(new_books.right() <= refresh.left() && refresh.right() <= px(width));
+                visual.simulate_click(refresh.center(), gpui::Modifiers::default());
+                assert!(matches!(
+                    backend.commands.try_recv(),
+                    Ok(CoreCommand::RefreshChannels)
+                ));
+                visual.run_until_parked();
+                let Some(new_books) = visual.debug_bounds("catalog-new-books") else {
+                    panic!("new books action disappeared");
+                };
+                visual.simulate_click(new_books.center(), gpui::Modifiers::default());
+                visual.run_until_parked();
+                app.read_with(&visual.cx, |app, _| assert!(app.show_recommendations));
+                assert!(backend.commands.try_recv().is_err());
+            }
+        }
     }
 
     #[gpui::test]
@@ -860,6 +1289,8 @@ mod tests {
                     CoreEvent::DownloadUpdated(DownloadRecord {
                         key,
                         file_name: "book.epub".into(),
+                        source_title: None,
+                        added_at: 0,
                         local_path: "books/book.epub".into(),
                         status: DownloadStatus::Downloading,
                         progress,
@@ -900,6 +1331,8 @@ mod tests {
             document_id: 8,
         };
         let job = QueuedDownload {
+            interrupted: true,
+            redownload: false,
             book: BookAttachment {
                 key,
                 file_name: "book.epub".into(),
@@ -914,6 +1347,7 @@ mod tests {
                 CoreEvent::DownloadState(TransferState {
                     queued: vec![job.clone()],
                     paused: true,
+                    restored: true,
                     ..Default::default()
                 }),
                 cx,
@@ -929,8 +1363,8 @@ mod tests {
             backend.commands.try_recv(),
             Ok(CoreCommand::SetQueuePaused(false))
         ));
-        // The next tab target is the waiting row's removal button.
-        cx.simulate_keystrokes("tab enter");
+        // Queue/history tabs precede the waiting row's removal button.
+        cx.simulate_keystrokes("tab tab tab enter");
         assert!(
             matches!(backend.commands.try_recv(), Ok(CoreCommand::CancelDownload(actual)) if actual == key)
         );
@@ -966,6 +1400,8 @@ mod tests {
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
         let jobs: Vec<_> = (0..20)
             .map(|index| QueuedDownload {
+                interrupted: false,
+                redownload: false,
                 book: BookAttachment {
                     key: DownloadKey {
                         channel_id: -1000000000001,
@@ -1052,6 +1488,8 @@ mod tests {
         let mut record = DownloadRecord {
             key,
             file_name: "books.zip".into(),
+            source_title: None,
+            added_at: 0,
             local_path: "books.zip".into(),
             status: DownloadStatus::Downloading,
             progress,
@@ -1161,13 +1599,15 @@ mod tests {
         let record = DownloadRecord {
             key,
             file_name: "Полное собрание книг с очень длинным названием 世界.zip".into(),
+            source_title: None,
+            added_at: 0,
             local_path: "books.zip".into(),
             status: DownloadStatus::Downloading,
             progress,
         };
         let metrics = TransferMetrics {
             bytes_per_second: Some(409_600),
-            remaining_seconds: Some(2760),
+            remaining_seconds: Some(9300),
         };
         app.update(&mut visual.cx, |app, cx| {
             app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
@@ -1191,7 +1631,10 @@ mod tests {
         assert_eq!(speed.right(), eta.right());
         assert!(eta.top() >= speed.bottom());
         app.read_with(&visual.cx, |app, _| {
-            assert!((speed.right() - app.download_scroll.bounds().right()).abs() <= px(1.));
+            // The new active panel has a 16px inset and a 1px border.
+            assert!(
+                (speed.right() - app.download_scroll.bounds().right() + px(17.)).abs() <= px(1.)
+            );
         });
         app.update(&mut visual.cx, |app, cx| {
             // Fast incoming updates must not change the visible sample.
@@ -1234,6 +1677,7 @@ mod tests {
             backend
                 .events
                 .try_send(CoreEvent::Ready(AppInfo {
+                    settings: tgbooks_core::AppSettings::new("books".into()),
                     data_directory: "data".into(),
                     download_directory: "books".into(),
                 }))
@@ -1272,7 +1716,7 @@ mod tests {
             app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, screen));
         }
         cx.simulate_keystrokes("tab tab enter");
-        app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Login));
+        app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Channels));
     }
 
     #[gpui::test]
@@ -1284,7 +1728,7 @@ mod tests {
             app.focus_handle.focus(window, cx);
             app
         });
-        cx.simulate_keystrokes("tab tab tab enter");
+        cx.simulate_keystrokes("tab tab enter");
         app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Channels));
         cx.simulate_keystrokes(platform::shortcut("cmd-b", "ctrl-b"));
         app.read_with(&cx.cx, |app, _| {
@@ -1297,7 +1741,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
         app.read_with(&cx.cx, |app, _| assert!(app.sidebar_open));
         cx.simulate_keystrokes("tab enter");
-        app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Login));
+        app.read_with(&cx.cx, |app, _| assert_eq!(app.screen, Screen::Channels));
     }
 
     #[gpui::test]

@@ -107,6 +107,18 @@ impl SecureSession {
         ApiCredentials::new(state.api_id, state.api_hash.clone()).map_err(|_| VaultError::Corrupt)
     }
 
+    pub fn account_id(&self) -> Result<Option<i64>, VaultError> {
+        let state = self.inner.state.lock().map_err(|_| VaultError::Io)?;
+        Ok(state.peers.iter().find_map(|peer| match peer {
+            PeerInfo::User {
+                id,
+                is_self: Some(true),
+                ..
+            } if *id > 0 => Some(*id),
+            _ => None,
+        }))
+    }
+
     async fn change(
         &self,
         change: impl FnOnce(&mut Snapshot) + Send + 'static,
@@ -351,6 +363,7 @@ mod tests {
         let keys = Arc::new(MemoryKeys::default());
         let vault = Arc::new(Vault::open(directory.path(), keys.clone())?);
         let session = SecureSession::configure(vault, ApiCredentials::new(1, "0".repeat(32))?)?;
+        assert_eq!(session.account_id()?, None);
         session
             .cache_peer(PeerInfo::User {
                 id: 42,
@@ -372,6 +385,9 @@ mod tests {
             Some(PeerInfo::User { id: 42, .. })
         ));
         assert_eq!(restored.updates_state().await?.qts, 17);
+        assert_eq!(restored.account_id()?, Some(42));
+        restored.reset_authorization().await?;
+        assert_eq!(restored.account_id()?, None);
         Ok(())
     }
 }

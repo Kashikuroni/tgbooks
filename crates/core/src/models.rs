@@ -128,8 +128,12 @@ impl DownloadProgress {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DownloadRecord {
     pub key: DownloadKey,
+    /// Original Telegram name for display; local_path is independently sanitized.
     pub file_name: String,
     pub local_path: String,
+    pub source_title: Option<String>,
+    /// Unix seconds when this attempt was admitted. Zero means unavailable.
+    pub added_at: i64,
     pub status: DownloadStatus,
     pub progress: DownloadProgress,
 }

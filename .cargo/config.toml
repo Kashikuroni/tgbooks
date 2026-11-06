@@ -1,0 +1,10 @@
+[alias]
+xtask = "run --locked --package xtask --"
+
+[env]
+# Match the minimum used by the pinned Zed / GPUI revision.
+MACOSX_DEPLOYMENT_TARGET = "12.0"
+
+[target.x86_64-pc-windows-msvc]
+# The installed app must not depend on a developer's Visual C++ runtime install.
+rustflags = ["-C", "target-feature=+crt-static"]

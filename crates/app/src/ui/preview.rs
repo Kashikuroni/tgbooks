@@ -16,6 +16,58 @@ use tgbooks_core::{
 
 use super::{BookApp, Screen, icons::IconAssets};
 
+/// Rasterize the single SVG source at native icon sizes. The Rust xtask
+/// encodes these straight-alpha BGRA buffers into PNG/ICNS/ICO.
+pub fn render_app_icon() -> Result<()> {
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/icon-raster");
+    std::fs::create_dir_all(&output)?;
+    let renderer = gpui::SvgRenderer::new(Arc::new(IconAssets));
+    let parsed = renderer.parse_svg(include_bytes!("../../resources/branding/app-icon.svg"))?;
+    for pixels in [16_u32, 32, 48, 64, 128, 256, 512, 1024] {
+        let image = renderer.render_parsed(
+            &parsed,
+            gpui::SvgSize::ExactSize(size(pixels.into(), pixels.into())),
+        )?;
+        let bytes = image
+            .as_bytes(0)
+            .ok_or_else(|| anyhow::anyhow!("icon renderer produced no frame"))?;
+        std::fs::write(output.join(format!("{pixels}.bgra")), bytes)?;
+    }
+    println!("Icon raster buffers: {}", output.display());
+    Ok(())
+}
+
+/// Render proposals separately; never overwrite the installed icon assets.
+pub fn render_icon_concepts() -> Result<()> {
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/icon-concepts");
+    std::fs::create_dir_all(&output)?;
+    let renderer = gpui::SvgRenderer::new(Arc::new(IconAssets));
+    for (name, source) in [
+        (
+            "open-book",
+            include_bytes!("../../resources/branding/concepts/open-book.svg").as_slice(),
+        ),
+        (
+            "download-book",
+            include_bytes!("../../resources/branding/concepts/download-book.svg").as_slice(),
+        ),
+    ] {
+        let parsed = renderer.parse_svg(source)?;
+        for pixels in [32_u32, 512] {
+            let image = renderer.render_parsed(
+                &parsed,
+                gpui::SvgSize::ExactSize(size(pixels.into(), pixels.into())),
+            )?;
+            let bytes = image
+                .as_bytes(0)
+                .ok_or_else(|| anyhow::anyhow!("icon renderer produced no frame"))?;
+            std::fs::write(output.join(format!("{name}-{pixels}.bgra")), bytes)?;
+        }
+    }
+    println!("Icon concepts: {}", output.display());
+    Ok(())
+}
+
 pub fn render() -> Result<()> {
     // MacPlatform must be initialized on the main thread, not a Rust test worker.
     let platform = gpui_platform::current_platform(true);
@@ -36,6 +88,7 @@ pub fn render() -> Result<()> {
     })?;
     let app = window.root(&mut cx)?;
     let info = AppInfo {
+        settings: tgbooks_core::AppSettings::new("/Users/demo/Книги/Telegram".into()),
         data_directory: "~/Library/Application Support/org.tgbooks.TelegramBookDownloader".into(),
         download_directory:
             "~/Library/Application Support/org.tgbooks.TelegramBookDownloader/books".into(),
@@ -71,6 +124,36 @@ pub fn render() -> Result<()> {
         app.navigate(Screen::Settings, cx);
     });
     save_frame(&mut cx, compact.into(), &output, "compact-settings.png")?;
+    for (name, snapshot) in [
+        ("settings-edited", window),
+        ("compact-settings-error", compact),
+    ] {
+        let view = snapshot.root(&mut cx)?;
+        view.update(&mut cx, |app, cx| {
+            app.navigate(Screen::Settings, cx);
+            app.preferences.update(cx, |view, cx| {
+                view.preview_edit(cx);
+                if name.contains("error") {
+                    view.complete(Err(tgbooks_core::SettingsError::Directory), cx);
+                }
+            });
+        });
+        save_frame(&mut cx, snapshot.into(), &output, &format!("{name}.png"))?;
+    }
+    for (name, snapshot, available, enabled) in [
+        ("settings-notifications-bundled", window, true, true),
+        ("settings-notifications-off", window, true, false),
+        ("compact-settings-notifications-cli", compact, false, true),
+    ] {
+        let view = snapshot.root(&mut cx)?;
+        view.update(&mut cx, |app, cx| {
+            app.navigate(Screen::Settings, cx);
+            app.preferences.update(cx, |view, cx| {
+                view.preview_notifications(available, enabled, cx)
+            });
+        });
+        save_frame(&mut cx, snapshot.into(), &output, &format!("{name}.png"))?;
+    }
     compact_app.update(&mut cx, |app, cx| {
         app.apply_event(CoreEvent::Authentication(AuthState::default()), cx);
         app.navigate(Screen::Login, cx);
@@ -208,6 +291,14 @@ pub fn render() -> Result<()> {
             Screen::Downloads,
         ),
         (
+            "queue-restored",
+            DownloadStatus::Failed,
+            38_000_000,
+            Some(80_000_000),
+            None,
+            Screen::Downloads,
+        ),
+        (
             "download-large-zip",
             DownloadStatus::Downloading,
             268_435_456,
@@ -255,6 +346,8 @@ pub fn render() -> Result<()> {
                         key.message_id += index;
                         key.document_id += i64::from(index);
                         QueuedDownload {
+                            interrupted: name == "queue-restored" && index == 1,
+                            redownload: false,
                             book: BookAttachment {
                                 key,
                                 file_name: format!("Книга {index} — A very long title 世界.epub"),
@@ -268,7 +361,8 @@ pub fn render() -> Result<()> {
             } else {
                 Vec::new()
             },
-            paused: name == "queue-paused",
+            paused: name == "queue-paused" || name == "queue-restored",
+            restored: name == "queue-restored",
             error_file: error.map(|_| record.file_name.clone()),
             ..Default::default()
         };
@@ -326,6 +420,209 @@ pub fn render() -> Result<()> {
             cx.update_window(snapshot.into(), |_, window, _| window.remove_window())?;
         }
     }
+    // The approved layouts, with the same application entities at three sizes.
+    for (prefix, width, height) in [
+        ("wide", 1280., 800.),
+        ("standard", 1040., 700.),
+        ("minimum", 760., 520.),
+    ] {
+        let (ui, _backend) = tgbooks_core::connect();
+        let snapshot = cx.open_window(size(px(width), px(height)), |_, cx| {
+            cx.new(|cx| BookApp::new(ui, cx))
+        })?;
+        let view = snapshot.root(&mut cx)?;
+        let mut catalog = catalog_fixture(true);
+        catalog.sources = tgbooks_core::SavedSources {
+            account: Some(1),
+            loaded: true,
+            ..Default::default()
+        };
+        let records: Vec<_> = catalog
+            .books
+            .iter()
+            .enumerate()
+            .map(|(index, book)| {
+                Ok(DownloadRecord {
+                    key: book.key,
+                    file_name: book.file_name.clone(),
+                    local_path: format!(
+                        "/Users/demo/Книги/Telegram/book-{index}.{}",
+                        book.format.extension()
+                    ),
+                    source_title: Some(catalog.channels[index % 2].title.clone()),
+                    added_at: 1_794_000_000 - index as i64 * 3600,
+                    status: DownloadStatus::Completed,
+                    progress: DownloadProgress::new(
+                        book.size_bytes.unwrap_or(100),
+                        Some(book.size_bytes.unwrap_or(100)),
+                    )?,
+                })
+            })
+            .collect::<Result<_, tgbooks_core::InvalidProgress>>()?;
+        view.update(&mut cx, |app, cx| {
+            app.apply_event(
+                CoreEvent::Authentication(AuthState {
+                    step: AuthStep::Authorized,
+                    account: Some(tgbooks_core::AccountProfile {
+                        username: Some("book_reader".into()),
+                        name: "Reader".into(),
+                    }),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::HistoryLoaded(records.clone()), cx);
+            app.apply_event(CoreEvent::Catalog(catalog.clone()), cx);
+            app.catalog
+                .update(cx, |catalog, cx| catalog.preview_selection(cx));
+            app.navigate(Screen::Channels, cx);
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("redesign-{prefix}-channels.png"),
+        )?;
+        view.update(&mut cx, |app, cx| {
+            app.catalog
+                .update(cx, |catalog, cx| catalog.preview_completed(cx));
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("redownload-{prefix}-channels.png"),
+        )?;
+        for (name, missing) in [("list", false), ("unavailable", true)] {
+            view.update(&mut cx, |app, cx| {
+                app.catalog
+                    .update(cx, |catalog, cx| catalog.preview_sources(missing, cx));
+            });
+            save_frame(
+                &mut cx,
+                snapshot.into(),
+                &output,
+                &format!("sources-{prefix}-{name}.png"),
+            )?;
+        }
+        view.update(&mut cx, |app, cx| {
+            app.apply_event(CoreEvent::Catalog(catalog.clone()), cx);
+            app.apply_event(
+                CoreEvent::Recommendations(tgbooks_core::RecommendationState {
+                    account: Some(1),
+                    loaded: true,
+                    items: catalog
+                        .books
+                        .iter()
+                        .enumerate()
+                        .map(|(index, book)| tgbooks_core::Recommendation {
+                            book: book.clone(),
+                            source_title: catalog.channels[index % 2].title.clone(),
+                            message_date: 1_794_000_000 - index as i64 * 3600,
+                            status: if index == 1 {
+                                tgbooks_core::RecommendationStatus::Read
+                            } else {
+                                tgbooks_core::RecommendationStatus::Unread
+                            },
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            // Recommendation previews are new findings, not already downloaded fixtures.
+            app.apply_event(CoreEvent::HistoryLoaded(Vec::new()), cx);
+            app.show_recommendations = true;
+            app.navigate(Screen::Channels, cx);
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("recommendations-{prefix}.png"),
+        )?;
+        view.update(&mut cx, |app, cx| {
+            app.recommendations
+                .update(cx, |view, cx| view.preview_selection(cx));
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("recommendations-selected-{prefix}.png"),
+        )?;
+        view.update(&mut cx, |app, cx| {
+            app.show_recommendations = false;
+            app.apply_event(CoreEvent::HistoryLoaded(records.clone()), cx);
+        });
+        view.update(&mut cx, |app, cx| {
+            app.navigate(Screen::Library, cx);
+            app.library
+                .update(cx, |library, cx| library.preview_selection(cx));
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("redesign-{prefix}-library.png"),
+        )?;
+        let mut active = download_fixture(
+            DownloadStatus::Downloading,
+            268_435_456,
+            Some(1_503_238_554),
+        )?;
+        active.file_name = "Полное собрание сочинений.zip".into();
+        active.local_path = "/Users/demo/Книги/Telegram/archive.zip".into();
+        view.update(&mut cx, |app, cx| {
+            app.apply_event(
+                CoreEvent::DownloadState(TransferState {
+                    active: Some(active.key),
+                    queued: catalog
+                        .books
+                        .iter()
+                        .take(3)
+                        .map(|book| QueuedDownload {
+                            book: book.clone(),
+                            directory: "/Users/demo/Книги/Telegram".into(),
+                            interrupted: false,
+                            redownload: false,
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            app.apply_event(CoreEvent::DownloadUpdated(active.clone()), cx);
+            app.apply_event(
+                CoreEvent::DownloadMetrics {
+                    key: active.key,
+                    metrics: TransferMetrics {
+                        bytes_per_second: Some(409_600),
+                        remaining_seconds: Some(2760),
+                    },
+                },
+                cx,
+            );
+            app.navigate(Screen::Downloads, cx);
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("redesign-{prefix}-downloads.png"),
+        )?;
+        view.update(&mut cx, |app, cx| {
+            app.show_history = true;
+            cx.notify();
+        });
+        save_frame(
+            &mut cx,
+            snapshot.into(),
+            &output,
+            &format!("redesign-{prefix}-history.png"),
+        )?;
+        cx.update_window(snapshot.into(), |_, window, _| window.remove_window())?;
+    }
     println!("UI previews: {}", output.display());
     Ok(())
 }
@@ -344,6 +641,8 @@ fn download_fixture(
             document_id: 1,
         },
         file_name: file_name.into(),
+        source_title: Some("Научная библиотека".into()),
+        added_at: 1_794_000_000,
         local_path: format!("/Users/demo/Книги/{file_name}"),
         status,
         progress: DownloadProgress::new(bytes, total)?,

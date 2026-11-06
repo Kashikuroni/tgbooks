@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use tgbooks_core::{AppInfo, CoreEvent, ServiceConnection, ServiceFailure, run_service};
+use tgbooks_core::{
+    AppInfo, AppSettings, CoreEvent, ServiceConnection, ServiceFailure, SettingsStore, run_service,
+};
 use tgbooks_downloader::LocalDownloader;
 use tgbooks_storage::{AppLock, AppLockError, AppPaths, Storage};
 use tgbooks_telegram::TelegramAuth;
@@ -59,7 +61,13 @@ async fn initialize(paths: AppPaths) -> Result<(Storage, AppInfo)> {
     let storage = Storage::open(&paths.database())
         .await
         .context("could not open download history")?;
+    let settings = storage
+        .load_settings()
+        .await
+        .map_err(|_| anyhow::anyhow!("could not load application settings"))?
+        .unwrap_or_else(|| AppSettings::new(paths.download_directory()));
     let info = AppInfo {
+        settings,
         data_directory: paths.data_directory().to_string_lossy().into_owned(),
         download_directory: paths.download_directory().to_string_lossy().into_owned(),
     };
@@ -82,7 +90,29 @@ mod tests {
 
     impl tgbooks_core::BookSource for RestoredAuth {}
 
+    #[tokio::test]
+    async fn startup_restores_saved_preferences_instead_of_replacing_them_with_defaults()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths::in_directory(root.path().to_path_buf())?;
+        let (storage, info) = initialize(paths.clone()).await?;
+        assert_eq!(info.settings, AppSettings::new(paths.download_directory()));
+        let directory = root.path().join("Книги");
+        tokio::fs::create_dir(&directory).await?;
+        let Ok(expected) = storage.save_settings(&AppSettings::new(directory)).await else {
+            anyhow::bail!("settings were not saved");
+        };
+        storage.close().await;
+        let (reopened, restored) = initialize(paths).await?;
+        assert_eq!(restored.settings, expected);
+        reopened.close().await;
+        Ok(())
+    }
+
     impl tgbooks_core::Authentication for RestoredAuth {
+        fn account_id(&self) -> Option<i64> {
+            Some(1)
+        }
         async fn execute(
             &mut self,
             _: tgbooks_core::AuthAction,
@@ -118,6 +148,8 @@ mod tests {
                 document_id: 3,
             },
             file_name: "book.epub".into(),
+            source_title: None,
+            added_at: 0,
             local_path: paths
                 .download_directory()
                 .join("book.epub")
@@ -174,6 +206,10 @@ mod tests {
                 ..
             })
         ));
+        assert!(
+            matches!(ui.events.recv().await?, CoreEvent::Recommendations(state)
+            if state.account == Some(1) && state.loaded && !state.monitoring && state.items.is_empty())
+        );
         ui.commands.send(CoreCommand::RefreshHistory).await?;
         assert_eq!(
             ui.events.recv().await?,

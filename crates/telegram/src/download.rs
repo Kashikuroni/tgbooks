@@ -56,9 +56,13 @@ impl BookSource for TelegramAuth {
                         false,
                     )
                     .ok_or(CatalogError::Unavailable)?;
-                    let chunks = Box::new(TelegramChunks(client.iter_download(&document)));
+                    let chunks = Box::new(TelegramChunks {
+                        iter: Some(client.iter_download(&document)),
+                        skip_prefix: 0,
+                    });
                     Ok(RemoteBook {
                         book,
+                        source_title: Some(channel.title().to_owned()),
                         chunks: chunks as Box<dyn BookChunks>,
                     })
                 },
@@ -70,17 +74,62 @@ impl BookSource for TelegramAuth {
     }
 }
 
-struct TelegramChunks(DownloadIter);
+struct TelegramChunks {
+    iter: Option<DownloadIter>,
+    skip_prefix: usize,
+}
+
+// Official Grammers DownloadIter defaults to 512 KiB. skip_chunks changes the
+// request offset in those units; discard the leading bytes for an exact seek.
+const CHUNK_SIZE: u64 = 512 * 1024;
+
+fn resume_position(offset: u64) -> Result<(i32, usize), DownloadError> {
+    Ok((
+        i32::try_from(offset / CHUNK_SIZE).map_err(|_| DownloadError::InvalidFile)?,
+        (offset % CHUNK_SIZE) as usize,
+    ))
+}
 
 impl BookChunks for TelegramChunks {
+    fn seek(&mut self, offset: u64) -> Result<(), DownloadError> {
+        let (chunks, prefix) = resume_position(offset)?;
+        let iter = self.iter.take().ok_or(DownloadError::Internal)?;
+        self.iter = Some(iter.skip_chunks(chunks));
+        self.skip_prefix = prefix;
+        Ok(())
+    }
+
     fn next_chunk(&mut self) -> ChunkFuture<'_> {
         Box::pin(async {
-            guarded(
-                async { self.0.next().await.map_err(map_error) },
+            let chunk = guarded(
+                async {
+                    self.iter
+                        .as_mut()
+                        .ok_or(CatalogError::InvalidResponse)?
+                        .next()
+                        .await
+                        .map_err(map_error)
+                },
                 Duration::from_secs(30),
             )
             .await
-            .map_err(download_error)
+            .map_err(download_error)?;
+            match chunk {
+                Some(mut bytes) => {
+                    if self.skip_prefix > bytes.len() {
+                        return Err(DownloadError::Incomplete);
+                    }
+                    bytes.drain(..self.skip_prefix);
+                    self.skip_prefix = 0;
+                    if bytes.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(bytes))
+                    }
+                }
+                None if self.skip_prefix != 0 => Err(DownloadError::Incomplete),
+                None => Ok(None),
+            }
         })
     }
 }
@@ -103,6 +152,25 @@ fn download_error(error: CatalogError) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_offsets_are_aligned_without_losing_the_exact_byte_position()
+    -> Result<(), DownloadError> {
+        for offset in [
+            0,
+            3,
+            CHUNK_SIZE - 1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 123,
+            1_400_000_000,
+        ] {
+            let (chunks, prefix) = resume_position(offset)?;
+            assert_eq!(chunks as u64 * CHUNK_SIZE + prefix as u64, offset);
+            assert!(prefix < CHUNK_SIZE as usize);
+        }
+        assert_eq!(resume_position(u64::MAX), Err(DownloadError::InvalidFile));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn download_before_login_does_not_open_a_session_or_contact_telegram()

@@ -1,7 +1,12 @@
 //! SQLite and operating-system adapters. No UI or Telegram dependency.
 
+mod checkpoints;
 mod lock;
 mod paths;
+mod queue;
+mod recommendations;
+mod settings;
+mod sources;
 
 use std::{path::Path, time::Duration};
 
@@ -12,8 +17,8 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use tgbooks_core::{
-    DownloadError, DownloadHistory, DownloadKey, DownloadProgress, DownloadRecord,
-    DownloadRepository, DownloadStatus,
+    DownloadCheckpoint, DownloadError, DownloadHistory, DownloadKey, DownloadProgress,
+    DownloadRecord, DownloadRepository, DownloadStatus,
 };
 use thiserror::Error;
 
@@ -52,7 +57,7 @@ impl Storage {
         Ok(Self { pool })
     }
 
-    /// The composite primary key makes deduplication atomic, not check-then-insert.
+    /// Insert one local copy atomically; normal download admission uses `claim`.
     pub async fn insert_download(&self, record: &DownloadRecord) -> Result<bool, StorageError> {
         let downloaded = i64::try_from(record.progress.downloaded_bytes())
             .map_err(|_| StorageError::InvalidData)?;
@@ -64,9 +69,9 @@ impl Storage {
             .map_err(|_| StorageError::InvalidData)?;
         let result = sqlx::query(
             "INSERT INTO downloads
-             (channel_id, message_id, document_id, file_name, local_path, status, downloaded_bytes, total_bytes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (channel_id, message_id, document_id) DO NOTHING",
+             (channel_id, message_id, document_id, file_name, local_path, status, downloaded_bytes, total_bytes, source_title, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (channel_id, message_id, document_id, local_path) DO NOTHING",
         )
         .bind(record.key.channel_id)
         .bind(record.key.message_id)
@@ -76,6 +81,8 @@ impl Storage {
         .bind(record.status.as_str())
         .bind(downloaded)
         .bind(total)
+        .bind(&record.source_title)
+        .bind(record.added_at)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -104,7 +111,7 @@ impl DownloadHistory for Storage {
     async fn list_downloads(&self) -> Result<Vec<DownloadRecord>, Self::Error> {
         let rows = sqlx::query(
             "SELECT channel_id, message_id, document_id, file_name, local_path, status,
-                    downloaded_bytes, total_bytes
+                    downloaded_bytes, total_bytes, source_title, created_at
              FROM downloads ORDER BY created_at DESC, channel_id, message_id, document_id",
         )
         .fetch_all(&self.pool)
@@ -114,37 +121,43 @@ impl DownloadHistory for Storage {
 }
 
 impl DownloadRepository for Storage {
+    async fn checkpoint(
+        &self,
+        record: &DownloadRecord,
+    ) -> Result<Option<DownloadCheckpoint>, DownloadError> {
+        self.read_checkpoint(record).await
+    }
+
+    async fn save_checkpoint(
+        &self,
+        record: &DownloadRecord,
+        checkpoint: &DownloadCheckpoint,
+    ) -> Result<(), DownloadError> {
+        self.write_checkpoint(record, checkpoint).await
+    }
+
+    async fn clear_checkpoint(&self, record: &DownloadRecord) -> Result<(), DownloadError> {
+        self.delete_checkpoint(record).await
+    }
+
     async fn claim(&self, record: &DownloadRecord) -> Result<bool, DownloadError> {
-        if record.status != DownloadStatus::Queued || record.progress.downloaded_bytes() != 0 {
-            return Err(DownloadError::Storage);
-        }
-        let (_, total) = sql_progress(record)?;
-        let result = sqlx::query(
-            "INSERT INTO downloads
-             (channel_id, message_id, document_id, file_name, local_path, status, downloaded_bytes, total_bytes)
-             VALUES (?, ?, ?, ?, ?, 'queued', 0, ?)
-             ON CONFLICT (channel_id, message_id, document_id) DO UPDATE SET
-               file_name = excluded.file_name, local_path = excluded.local_path,
-               status = 'queued', downloaded_bytes = 0, total_bytes = excluded.total_bytes,
-               created_at = unixepoch()
-             WHERE downloads.status = 'failed'",
-        )
-        .bind(record.key.channel_id)
-        .bind(record.key.message_id)
-        .bind(record.key.document_id)
-        .bind(&record.file_name)
-        .bind(&record.local_path)
-        .bind(total)
-        .execute(&self.pool)
-        .await.map_err(|_| DownloadError::Storage)?;
-        Ok(result.rows_affected() == 1)
+        self.claim_record(record, false).await
+    }
+
+    async fn claim_again(&self, record: &DownloadRecord) -> Result<bool, DownloadError> {
+        self.claim_record(record, true).await
     }
 
     async fn update(&self, record: &DownloadRecord) -> Result<(), DownloadError> {
         let (downloaded, total) = sql_progress(record)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| DownloadError::Storage)?;
         let result = sqlx::query(
             "UPDATE downloads SET status = ?, downloaded_bytes = ?, total_bytes = ?
-             WHERE channel_id = ? AND message_id = ? AND document_id = ?
+             WHERE channel_id = ? AND message_id = ? AND document_id = ? AND local_path = ?
                AND status IN ('queued', 'downloading') AND downloaded_bytes <= ?",
         )
         .bind(record.status.as_str())
@@ -153,13 +166,29 @@ impl DownloadRepository for Storage {
         .bind(record.key.channel_id)
         .bind(record.key.message_id)
         .bind(record.key.document_id)
+        .bind(&record.local_path)
         .bind(downloaded)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| DownloadError::Storage)?;
         if result.rows_affected() != 1 {
             return Err(DownloadError::Storage);
         }
+        if record.status == DownloadStatus::Completed {
+            sqlx::query("DELETE FROM download_checkpoints WHERE channel_id = ? AND message_id = ? AND document_id = ? AND local_path = ?")
+                .bind(record.key.channel_id).bind(record.key.message_id).bind(record.key.document_id)
+                .bind(&record.local_path)
+                .execute(&mut *transaction).await.map_err(|_| DownloadError::Storage)?;
+            // Completion and removal of durable intent are atomic. A crash before
+            // Core's next snapshot must not restore an already finished repeat.
+            sqlx::query("DELETE FROM download_queue WHERE channel_id = ? AND message_id = ? AND document_id = ?")
+                .bind(record.key.channel_id).bind(record.key.message_id).bind(record.key.document_id)
+                .execute(&mut *transaction).await.map_err(|_| DownloadError::Storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| DownloadError::Storage)?;
         Ok(())
     }
 
@@ -171,6 +200,54 @@ impl DownloadRepository for Storage {
         .await
         .map_err(|_| DownloadError::Storage)?;
         Ok(())
+    }
+}
+
+impl Storage {
+    async fn claim_record(
+        &self,
+        record: &DownloadRecord,
+        redownload: bool,
+    ) -> Result<bool, DownloadError> {
+        if record.status != DownloadStatus::Queued || record.progress.downloaded_bytes() != 0 {
+            return Err(DownloadError::Storage);
+        }
+        let (_, total) = sql_progress(record)?;
+        let result = sqlx::query(
+            "INSERT INTO downloads
+             (channel_id, message_id, document_id, file_name, local_path, status, downloaded_bytes, total_bytes, source_title, created_at)
+             SELECT ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?
+             WHERE (? OR NOT EXISTS (
+                 SELECT 1 FROM downloads WHERE channel_id = ? AND message_id = ?
+                   AND document_id = ? AND status = 'completed'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM downloads WHERE channel_id = ? AND message_id = ?
+                   AND document_id = ? AND status IN ('queued', 'downloading'))
+             ON CONFLICT (channel_id, message_id, document_id, local_path) DO UPDATE SET
+               file_name = excluded.file_name, local_path = excluded.local_path,
+               status = 'queued', downloaded_bytes = 0, total_bytes = excluded.total_bytes,
+               created_at = excluded.created_at, source_title = excluded.source_title
+             WHERE downloads.status = 'failed' OR (? AND downloads.status = 'completed')",
+        )
+        .bind(record.key.channel_id)
+        .bind(record.key.message_id)
+        .bind(record.key.document_id)
+        .bind(&record.file_name)
+        .bind(&record.local_path)
+        .bind(total)
+        .bind(&record.source_title)
+        .bind(record.added_at)
+        .bind(redownload)
+        .bind(record.key.channel_id)
+        .bind(record.key.message_id)
+        .bind(record.key.document_id)
+        .bind(record.key.channel_id)
+        .bind(record.key.message_id)
+        .bind(record.key.document_id)
+        .bind(redownload)
+        .execute(&self.pool)
+        .await.map_err(|_| DownloadError::Storage)?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -209,6 +286,8 @@ fn decode_record(row: SqliteRow) -> Result<DownloadRecord, StorageError> {
         },
         file_name: row.try_get("file_name")?,
         local_path: row.try_get("local_path")?,
+        source_title: row.try_get("source_title")?,
+        added_at: row.try_get("created_at")?,
         status,
         progress: DownloadProgress::new(downloaded, total)
             .map_err(|_| StorageError::InvalidData)?,
@@ -227,6 +306,8 @@ mod tests {
                 document_id: 99,
             },
             file_name: "Книга.epub".into(),
+            source_title: None,
+            added_at: 0,
             local_path: "books/Книга.epub".into(),
             status: DownloadStatus::Completed,
             progress: DownloadProgress::new(100, Some(100))?,
@@ -239,7 +320,9 @@ mod tests {
         let path = temporary.path().join("История книг.sqlite3");
         let storage = Storage::open(&path).await?;
         assert!(storage.list_downloads().await?.is_empty());
-        let expected = record()?;
+        let mut expected = record()?;
+        expected.source_title = Some("Книжная полка 世界".into());
+        expected.added_at = 1_794_000_000;
         assert!(storage.insert_download(&expected).await?);
         assert!(!storage.insert_download(&expected).await?);
         assert!(storage.contains(expected.key).await?);

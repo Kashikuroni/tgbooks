@@ -73,6 +73,7 @@ impl BookSource for FakeTelegram {
             attachment.key = key;
             Ok(RemoteBook {
                 book: attachment,
+                source_title: None,
                 chunks: Box::new(EmptyChunks),
             })
         })
@@ -80,6 +81,9 @@ impl BookSource for FakeTelegram {
 }
 
 impl Authentication for FakeTelegram {
+    fn account_id(&self) -> Option<i64> {
+        Some(1)
+    }
     async fn execute(&mut self, _: AuthAction) -> Result<AuthStep, AuthFailure> {
         Ok(AuthStep::Authorized)
     }
@@ -99,6 +103,18 @@ impl ChannelCatalog for FakeTelegram {
 }
 
 struct EmptyHistory;
+impl crate::SettingsStore for EmptyHistory {}
+impl crate::SourceStore for EmptyHistory {}
+impl crate::RecommendationStore for EmptyHistory {}
+impl QueueStore for EmptyHistory {
+    async fn load_queue(&self, _: i64) -> Result<Vec<crate::QueuedDownload>, DownloadError> {
+        Ok(Vec::new())
+    }
+    async fn save_queue(&self, _: i64, _: &[crate::QueuedDownload]) -> Result<(), DownloadError> {
+        Ok(())
+    }
+}
+
 impl DownloadHistory for EmptyHistory {
     type Error = Infallible;
     async fn list_downloads(&self) -> Result<Vec<DownloadRecord>, Self::Error> {
@@ -110,6 +126,14 @@ impl DownloadHistory for EmptyHistory {
 struct BlockingEngine {
     stopped: Arc<AtomicBool>,
 }
+
+struct WorkerStopped(Arc<AtomicBool>);
+impl Drop for WorkerStopped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl DownloadEngine for BlockingEngine {
     async fn recover(&self) -> Result<(), DownloadError> {
         Ok(())
@@ -121,11 +145,14 @@ impl DownloadEngine for BlockingEngine {
         updates: Sender<DownloadUpdate>,
         cancellation: CancellationToken,
     ) -> Result<DownloadRecord, DownloadError> {
+        let _stopped = WorkerStopped(self.stopped.clone());
         let _ = updates
             .send(
                 DownloadRecord {
                     key: remote.book.key,
                     file_name: remote.book.file_name,
+                    source_title: None,
+                    added_at: 0,
                     local_path: "books/book.epub".into(),
                     status: DownloadStatus::Downloading,
                     progress: DownloadProgress::new(0, Some(3))
@@ -161,6 +188,7 @@ async fn unauthorized_protected_unknown_and_relative_requests_never_open_the_sou
     let calls = telegram.calls.clone();
     let mut auth = AuthController::new(telegram);
     let mut queue = transfers::DownloadQueue::default();
+    queue.owner = Some(1);
     let running = None;
     let mut selected = catalog();
     queue.enqueue(
@@ -222,6 +250,7 @@ async fn transfer_flood_wait_blocks_new_downloads_and_authentication_locally() {
     let (progress, _progress_rx) = async_channel::unbounded();
     let mut running = None;
     let mut queue = transfers::DownloadQueue::default();
+    queue.owner = Some(1);
     queue.enqueue(
         vec![key()],
         std::env::temp_dir(),
@@ -230,13 +259,16 @@ async fn transfer_flood_wait_blocks_new_downloads_and_authentication_locally() {
         &running,
         &[],
     );
-    queue.start_next(
-        &mut auth,
-        &selected,
-        &UnusedDownloads,
-        &progress,
-        &mut running,
-    );
+    queue
+        .start_next(
+            &EmptyHistory,
+            &mut auth,
+            &selected,
+            &UnusedDownloads,
+            &progress,
+            &mut running,
+        )
+        .await;
     let result = transfers::wait(&mut running).await;
     running.take();
     assert!(
@@ -260,13 +292,16 @@ async fn transfer_flood_wait_blocks_new_downloads_and_authentication_locally() {
         &[],
     );
     queue.set_paused(false, &auth);
-    queue.start_next(
-        &mut auth,
-        &selected,
-        &UnusedDownloads,
-        &progress,
-        &mut running,
-    );
+    queue
+        .start_next(
+            &EmptyHistory,
+            &mut auth,
+            &selected,
+            &UnusedDownloads,
+            &progress,
+            &mut running,
+        )
+        .await;
     assert!(queue.state.paused);
     assert_eq!(queue.state.queued.len(), 1);
     assert!(running.is_none());
@@ -287,6 +322,7 @@ async fn changed_protection_removes_catalogue_candidates_before_any_file_transfe
     let (progress, _progress_rx) = async_channel::unbounded();
     let mut running = None;
     let mut queue = transfers::DownloadQueue::default();
+    queue.owner = Some(1);
     queue.enqueue(
         vec![key()],
         std::env::temp_dir(),
@@ -295,13 +331,16 @@ async fn changed_protection_removes_catalogue_candidates_before_any_file_transfe
         &running,
         &[],
     );
-    queue.start_next(
-        &mut auth,
-        &selected,
-        &UnusedDownloads,
-        &progress,
-        &mut running,
-    );
+    queue
+        .start_next(
+            &EmptyHistory,
+            &mut auth,
+            &selected,
+            &UnusedDownloads,
+            &progress,
+            &mut running,
+        )
+        .await;
     let result = transfers::wait(&mut running).await;
     running.take();
     assert!(
@@ -331,6 +370,7 @@ async fn running_actor()
             FakeTelegram::default(),
             engine,
             AppInfo {
+                settings: crate::AppSettings::new("books".into()),
                 data_directory: "data".into(),
                 download_directory: "books".into(),
             },
@@ -351,7 +391,6 @@ async fn running_actor()
         |event| matches!(event, CoreEvent::Catalog(state) if state.selected.is_some()),
     )
     .await?;
-    ui.commands.send(CoreCommand::ScanNextPage).await?;
     next_matching(
         &ui,
         |event| matches!(event, CoreEvent::Catalog(state) if state.scan_started),
@@ -373,6 +412,27 @@ async fn actor_reports_progress_rejects_parallel_scans_and_accepts_cancellation(
     let (ui, task, stopped) = running_actor().await?;
     ui.commands.send(CoreCommand::RefreshChannels).await?;
     next_matching(&ui, |event| matches!(event, CoreEvent::Catalog(state) if state.error == Some(CatalogError::Busy))).await?;
+    ui.commands
+        .send(CoreCommand::SaveSettings(crate::AppSettings::new(
+            std::env::temp_dir(),
+        )))
+        .await?;
+    next_matching(&ui, |event| {
+        matches!(
+            event,
+            CoreEvent::SettingsSaved(Err(crate::SettingsError::Busy))
+        )
+    })
+    .await?;
+    // Selecting a new source now starts history I/O, so it must not block cancel.
+    ui.commands
+        .send(CoreCommand::SelectChannel(Some(key().channel_id - 1)))
+        .await?;
+    next_matching(&ui, |event| {
+        matches!(event, CoreEvent::Catalog(state)
+        if state.error == Some(CatalogError::Busy) && state.selected == Some(key().channel_id))
+    })
+    .await?;
     ui.commands
         .send(CoreCommand::DownloadBooks {
             keys: vec![key()],
@@ -399,13 +459,13 @@ async fn actor_reports_progress_rejects_parallel_scans_and_accepts_cancellation(
 }
 
 #[tokio::test]
-async fn shutdown_token_cancels_and_joins_the_active_worker() -> Result<(), Box<dyn Error>> {
+async fn shutdown_token_drops_and_joins_the_active_worker() -> Result<(), Box<dyn Error>> {
     let (ui, task, stopped) = running_actor().await?;
     ui.shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(1), task).await??;
     assert!(
         stopped.load(Ordering::SeqCst),
-        "the worker was detached instead of cancelled"
+        "the worker was detached instead of joined"
     );
     Ok(())
 }
@@ -430,6 +490,7 @@ async fn systemic_errors_pause_pending_jobs_and_revocation_discards_them() {
         DownloadError::FloodWait(60),
         DownloadError::SecureStorage,
         DownloadError::Storage,
+        DownloadError::Destination,
         DownloadError::Internal,
         DownloadError::Unauthorized,
     ] {
@@ -439,6 +500,7 @@ async fn systemic_errors_pause_pending_jobs_and_revocation_discards_them() {
         auth.complete(Ok(AuthStep::Authorized));
         let mut catalog = queue_catalog(2);
         let mut queue = transfers::DownloadQueue::default();
+        queue.owner = Some(1);
         queue.enqueue(
             catalog.books.iter().map(|book| book.key).collect(),
             std::env::temp_dir(),
@@ -468,13 +530,16 @@ async fn systemic_errors_pause_pending_jobs_and_revocation_discards_them() {
         );
         let (progress, _receiver) = async_channel::unbounded();
         let mut running = None;
-        queue.start_next(
-            &mut auth,
-            &catalog,
-            &UnusedDownloads,
-            &progress,
-            &mut running,
-        );
+        queue
+            .start_next(
+                &EmptyHistory,
+                &mut auth,
+                &catalog,
+                &UnusedDownloads,
+                &progress,
+                &mut running,
+            )
+            .await;
         assert!(running.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         if matches!(error, DownloadError::FloodWait(_)) {
@@ -492,10 +557,73 @@ async fn systemic_errors_pause_pending_jobs_and_revocation_discards_them() {
 }
 
 #[test]
+fn repeat_bypasses_only_completed_history_not_pending_jobs_or_protection()
+-> Result<(), Box<dyn Error>> {
+    let mut auth = AuthController::new(FakeTelegram::default());
+    auth.complete(Ok(AuthStep::Authorized));
+    let mut queue = transfers::DownloadQueue::default();
+    queue.owner = Some(1);
+    let mut catalog = catalog();
+    let completed = DownloadRecord {
+        key: key(),
+        file_name: "book.epub".into(),
+        local_path: "old/book.epub".into(),
+        source_title: None,
+        added_at: 0,
+        status: DownloadStatus::Completed,
+        progress: DownloadProgress::new(3, Some(3))?,
+    };
+    queue.enqueue(
+        vec![key()],
+        std::env::temp_dir(),
+        &auth,
+        &catalog,
+        &None,
+        std::slice::from_ref(&completed),
+    );
+    assert!(queue.state.queued.is_empty());
+    assert_eq!(queue.state.skipped_duplicates, 1);
+    queue.enqueue_with_policy(
+        vec![key()],
+        std::env::temp_dir(),
+        &auth,
+        &catalog,
+        &None,
+        (std::slice::from_ref(&completed), true),
+    );
+    assert_eq!(queue.state.queued.len(), 1);
+    assert!(queue.state.queued[0].redownload);
+    queue.enqueue_with_policy(
+        vec![key()],
+        std::env::temp_dir(),
+        &auth,
+        &catalog,
+        &None,
+        (std::slice::from_ref(&completed), true),
+    );
+    assert_eq!(queue.state.queued.len(), 1);
+    assert_eq!(queue.state.skipped_duplicates, 1);
+    queue.state.queued.clear();
+    catalog.channels[0].protected = true;
+    queue.enqueue_with_policy(
+        vec![key()],
+        std::env::temp_dir(),
+        &auth,
+        &catalog,
+        &None,
+        (&[completed], true),
+    );
+    assert!(queue.state.queued.is_empty());
+    assert_eq!(queue.state.error, Some(DownloadError::ProtectedContent));
+    Ok(())
+}
+
+#[test]
 fn batch_admission_is_atomic_bounded_and_skips_durable_duplicates() -> Result<(), Box<dyn Error>> {
     let mut auth = AuthController::new(FakeTelegram::default());
     auth.complete(Ok(AuthStep::Authorized));
     let mut queue = transfers::DownloadQueue::default();
+    queue.owner = Some(1);
     let catalog = queue_catalog(crate::MAX_PENDING_DOWNLOADS + 1);
     let first = catalog.books[0].key;
     let mut unknown = first;
@@ -515,6 +643,8 @@ fn batch_admission_is_atomic_bounded_and_skips_durable_duplicates() -> Result<()
     let completed = DownloadRecord {
         key: first,
         file_name: "book.epub".into(),
+        source_title: None,
+        added_at: 0,
         local_path: "book.epub".into(),
         status: DownloadStatus::Completed,
         progress: DownloadProgress::new(3, Some(3))?,
@@ -564,6 +694,13 @@ struct GatedEngine {
     maximum: Arc<AtomicUsize>,
 }
 
+struct ActiveWorker(Arc<AtomicUsize>);
+impl Drop for ActiveWorker {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl DownloadEngine for GatedEngine {
     async fn recover(&self) -> Result<(), DownloadError> {
         Ok(())
@@ -576,6 +713,7 @@ impl DownloadEngine for GatedEngine {
         cancel: CancellationToken,
     ) -> Result<DownloadRecord, DownloadError> {
         let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let _active = ActiveWorker(self.active.clone());
         self.maximum.fetch_max(count, Ordering::SeqCst);
         self.order
             .lock()
@@ -584,6 +722,8 @@ impl DownloadEngine for GatedEngine {
         let mut record = DownloadRecord {
             key: remote.book.key,
             file_name: remote.book.file_name,
+            source_title: None,
+            added_at: 0,
             local_path: "books/book.epub".into(),
             status: DownloadStatus::Downloading,
             progress: DownloadProgress::new(0, Some(3)).map_err(|_| DownloadError::InvalidFile)?,
@@ -593,7 +733,6 @@ impl DownloadEngine for GatedEngine {
             _ = cancel.cancelled() => Err(DownloadError::Cancelled),
             result = self.release.recv() => result.unwrap_or(Err(DownloadError::Network)),
         };
-        self.active.fetch_sub(1, Ordering::SeqCst);
         result?;
         record.status = DownloadStatus::Completed;
         record.progress =
@@ -612,6 +751,7 @@ async fn queue_actor(
             FakeTelegram::default(),
             engine,
             AppInfo {
+                settings: crate::AppSettings::new("books".into()),
                 data_directory: "data".into(),
                 download_directory: "books".into(),
             },
@@ -632,7 +772,6 @@ async fn queue_actor(
         |event| matches!(event, CoreEvent::Catalog(state) if state.selected.is_some()),
     )
     .await?;
-    ui.commands.send(CoreCommand::ScanNextPage).await?;
     next_matching(
         &ui,
         |event| matches!(event, CoreEvent::Catalog(state) if state.scan_started),
@@ -655,7 +794,7 @@ fn gated_engine() -> (GatedEngine, Sender<Result<(), DownloadError>>) {
 }
 
 #[tokio::test]
-async fn fifo_accepts_more_jobs_skips_duplicates_cancels_waiting_and_continues_after_error()
+async fn fifo_accepts_more_jobs_skips_duplicates_and_keeps_network_failures_for_manual_resume()
 -> Result<(), Box<dyn Error>> {
     let (engine, release) = gated_engine();
     let observed = engine.clone();
@@ -695,6 +834,27 @@ async fn fifo_accepts_more_jobs_skips_duplicates_cancels_waiting_and_continues_a
     )
     .await?;
     release.send(Err(DownloadError::Network)).await?;
+    next_matching(&ui, |event| {
+        matches!(event, CoreEvent::DownloadState(state)
+        if state.paused && state.active.is_none() && state.queued.len() == 3
+        && state.queued[0].book.key == keys[0] && state.queued[0].interrupted)
+    })
+    .await?;
+    assert_eq!(
+        observed
+            .order
+            .lock()
+            .map_err(|_| "poisoned test lock")?
+            .len(),
+        1
+    );
+    ui.commands.send(CoreCommand::SetQueuePaused(false)).await?;
+    next_matching(&ui, |event| {
+        matches!(event, CoreEvent::DownloadUpdated(record)
+        if record.key == keys[0])
+    })
+    .await?;
+    release.send(Ok(())).await?;
     next_matching(
         &ui,
         |event| matches!(event, CoreEvent::DownloadUpdated(record) if record.key == keys[2]),
@@ -710,7 +870,7 @@ async fn fifo_accepts_more_jobs_skips_duplicates_cancels_waiting_and_continues_a
     next_matching(&ui, |event| matches!(event, CoreEvent::DownloadState(state) if state.active.is_none() && state.queued.is_empty())).await?;
     assert_eq!(
         *observed.order.lock().map_err(|_| "poisoned test lock")?,
-        vec![keys[0], keys[2], keys[3]]
+        vec![keys[0], keys[0], keys[2], keys[3]]
     );
     assert_eq!(observed.maximum.load(Ordering::SeqCst), 1);
     // Successful jobs cannot be re-added even if the adapter returns stale history.
@@ -801,3 +961,6 @@ async fn shutdown_does_not_start_waiting_jobs() -> Result<(), Box<dyn Error>> {
     assert_eq!(observed.active.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+#[path = "queue_service_tests.rs"]
+mod persistent_queue_tests;

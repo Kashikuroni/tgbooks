@@ -18,6 +18,13 @@ pub enum Icon {
     Maximize,
     Close,
     Check,
+    Search,
+    ChevronDown,
+    File,
+    Pause,
+    Play,
+    Lock,
+    Copy,
 }
 
 impl Icon {
@@ -32,6 +39,13 @@ impl Icon {
         Self::Maximize,
         Self::Close,
         Self::Check,
+        Self::Search,
+        Self::ChevronDown,
+        Self::File,
+        Self::Pause,
+        Self::Play,
+        Self::Lock,
+        Self::Copy,
     ];
 
     fn path(self) -> &'static str {
@@ -46,6 +60,13 @@ impl Icon {
             Self::Maximize => "icons/maximize.svg",
             Self::Close => "icons/close.svg",
             Self::Check => "icons/check.svg",
+            Self::Search => "icons/search.svg",
+            Self::ChevronDown => "icons/chevron-down.svg",
+            Self::File => "icons/file.svg",
+            Self::Pause => "icons/pause.svg",
+            Self::Play => "icons/play.svg",
+            Self::Lock => "icons/lock.svg",
+            Self::Copy => "icons/copy.svg",
         }
     }
 
@@ -61,6 +82,13 @@ impl Icon {
             Self::Maximize => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5"><rect x="5" y="5" width="14" height="14" rx="1"/></svg>"#,
             Self::Close => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>"#,
             Self::Check => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>"#,
+            Self::Search => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>"#,
+            Self::ChevronDown => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#,
+            Self::File => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H5v18h14V8ZM14 3v6h5M8 13h8M8 17h6"/></svg>"#,
+            Self::Pause => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><path d="M8 5v14M16 5v14"/></svg>"#,
+            Self::Play => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linejoin="round"><path d="m7 4 13 8-13 8Z"/></svg>"#,
+            Self::Lock => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>"#,
+            Self::Copy => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linejoin="round"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/></svg>"#,
         }
     }
 

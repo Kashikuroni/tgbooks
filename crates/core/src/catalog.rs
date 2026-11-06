@@ -1,6 +1,9 @@
 //! Channel selection and paged book discovery, independent of Telegram and GPUI.
 
-use std::{collections::HashSet, future::Future};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+};
 
 use crate::{BookFormat, DownloadKey};
 
@@ -75,6 +78,14 @@ pub trait ChannelCatalog: Send {
         channel_id: i64,
         before: Option<i32>,
     ) -> impl Future<Output = Result<BookPage, CatalogError>> + Send;
+
+    fn scan_updates(
+        &mut self,
+        _channel_id: i64,
+        _before: Option<i32>,
+    ) -> impl Future<Output = Result<crate::MonitorPage, CatalogError>> + Send {
+        async { Err(CatalogError::UnsupportedReply) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,7 +97,11 @@ pub enum CatalogOperation {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CatalogState {
     pub authenticated: bool,
+    pub formats: crate::BookFormats,
     pub channels: Vec<ChannelSummary>,
+    /// Last successful source intent; never interpreted as Telegram permission.
+    pub sources: crate::SavedSources,
+    pub channels_loaded: bool,
     pub selected: Option<i64>,
     pub books: Vec<BookAttachment>,
     pub scanned_messages: u64,
@@ -98,9 +113,55 @@ pub struct CatalogState {
 }
 
 impl CatalogState {
+    pub(crate) fn clear_authorization(&mut self, error: Option<CatalogError>) {
+        *self = Self {
+            formats: self.formats,
+            error,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn set_formats(&mut self, formats: crate::BookFormats) -> bool {
+        if self.formats == formats {
+            return false;
+        }
+        self.formats = formats;
+        self.reset_scan();
+        self.error = None;
+        true
+    }
+
     pub fn selected_channel(&self) -> Option<&ChannelSummary> {
-        self.selected
-            .and_then(|id| self.channels.iter().find(|channel| channel.id == id))
+        self.selected.and_then(|id| self.channel(id))
+    }
+
+    pub fn channel(&self, id: i64) -> Option<&ChannelSummary> {
+        self.channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .or_else(|| {
+                self.sources
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+            })
+    }
+
+    /// Live metadata wins. Missing saved channels remain visible only as sources.
+    pub fn source_channels(&self) -> Vec<&ChannelSummary> {
+        let live: HashMap<_, _> = self
+            .channels
+            .iter()
+            .map(|channel| (channel.id, channel))
+            .collect();
+        let mut channels: Vec<_> = self
+            .sources
+            .channels
+            .iter()
+            .map(|saved| live.get(&saved.id).copied().unwrap_or(saved))
+            .collect();
+        channels.sort_by_cached_key(|channel| (channel.title.to_lowercase(), channel.id));
+        channels
     }
 
     pub fn busy(&self) -> bool {
@@ -110,14 +171,14 @@ impl CatalogState {
     pub fn can_scan(&self) -> bool {
         self.authenticated
             && !self.busy()
-            && self
-                .selected_channel()
-                .is_some_and(|channel| !channel.protected)
+            && self.selected_channel().is_some_and(|channel| {
+                !channel.protected && self.channels.iter().any(|live| live.id == channel.id)
+            })
             && (!self.scan_started || self.next_offset.is_some())
     }
 
     pub(crate) fn select(&mut self, id: Option<i64>) -> Result<(), CatalogError> {
-        if id.is_some_and(|id| !self.channels.iter().any(|channel| channel.id == id)) {
+        if id.is_some_and(|id| self.channel(id).is_none()) {
             return Err(CatalogError::Unavailable);
         }
         if self.selected != id {
@@ -141,13 +202,13 @@ impl CatalogState {
         channels.retain(|channel| ids.insert(channel.id));
         channels.sort_by_cached_key(|channel| (channel.title.to_lowercase(), channel.id));
         self.channels = channels;
+        self.channels_loaded = true;
         if self.selected.is_some() && self.selected_channel().is_none() {
             self.selected = None;
             self.reset_scan();
-        } else if self
-            .selected_channel()
-            .is_some_and(|channel| channel.protected)
-        {
+        } else if self.selected_channel().is_some_and(|channel| {
+            channel.protected || !self.channels.iter().any(|live| live.id == channel.id)
+        }) {
             self.reset_scan();
         }
     }
@@ -171,8 +232,11 @@ impl CatalogState {
             return Err(CatalogError::InvalidResponse);
         }
         let mut known: HashSet<_> = self.books.iter().map(|book| book.key).collect();
-        self.books
-            .extend(page.books.into_iter().filter(|book| known.insert(book.key)));
+        self.books.extend(
+            page.books
+                .into_iter()
+                .filter(|book| self.formats.contains(book.format) && known.insert(book.key)),
+        );
         self.scanned_messages = self
             .scanned_messages
             .saturating_add(u64::from(page.scanned));

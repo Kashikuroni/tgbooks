@@ -24,6 +24,7 @@ tgbooks-storage.workspace = true
 tgbooks-telegram.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
+chrono.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 tokio.workspace = true
@@ -34,3 +35,37 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "=1.8.0"
+rustix = { version = "=1.1.6", features = ["fs"] }
+tempfile.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "=3.0.12"
+
+[package.metadata.packager]
+product-name = "Telegram Books"
+identifier = "org.tgbooks.TelegramBookDownloader"
+description = "Local Telegram book downloader"
+category = "Education"
+publisher = "tgbooks"
+license-file = "../../LICENSE"
+icons = ["resources/branding/app-icon.icns", "resources/branding/app-icon.ico", "resources/branding/app-icon.png"]
+# Deliberate allowlist: never package sessions, SQLite, .env or downloaded books.
+resources = [
+    { src = "../../LICENSE", target = "licenses/LICENSE" },
+    { src = "NOTICE", target = "licenses/NOTICE" },
+    { src = "LICENSE-APACHE", target = "licenses/LICENSE-APACHE" },
+    { src = "../../target/licenses/THIRD_PARTY_NOTICES.txt", target = "licenses/THIRD_PARTY_NOTICES.txt" },
+]
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"
+info-plist-path = "resources/macos/Bundle.plist"
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+installer-icon = "resources/branding/app-icon.ico"
+languages = ["Russian", "English"]
+display-language-selector = true

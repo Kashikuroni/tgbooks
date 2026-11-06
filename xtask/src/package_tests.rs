@@ -152,30 +152,16 @@ fn packaging_plist_cannot_override_identity_icon_or_version() -> Result<()> {
 }
 
 #[test]
-fn windows_manifest_is_unprivileged_and_dpi_aware() -> Result<()> {
-    let text = fs::read_to_string(root().join("crates/app/resources/windows/tgbooks.manifest"))?;
-    let document = roxmltree::Document::parse(&text)?;
-    let level = document
-        .descendants()
-        .find(|node| {
-            node.has_tag_name((
-                "urn:schemas-microsoft-com:asm.v3",
-                "requestedExecutionLevel",
-            ))
-        })
-        .context("missing execution level")?;
-    assert_eq!(level.attribute("level"), Some("asInvoker"));
-    assert_eq!(level.attribute("uiAccess"), Some("false"));
-    for (tag, value) in [("dpiAwareness", "PerMonitorV2"), ("longPathAware", "true")] {
-        assert_eq!(
-            document
-                .descendants()
-                .find(|node| node
-                    .has_tag_name(("http://schemas.microsoft.com/SMI/2016/WindowsSettings", tag)))
-                .and_then(|node| node.text()),
-            Some(value)
-        );
-    }
+fn application_resources_do_not_duplicate_the_gpui_manifest() -> Result<()> {
+    // Windows gpui_platform enables gpui/windows-manifest. Two type-24, ID-1
+    // resources cause CVT1100/LNK1123 at link time, including in GPUI tests.
+    let text = fs::read_to_string(root().join("crates/app/resources/windows/app.rc"))?;
+    let resources: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect();
+    assert_eq!(resources, ["1 ICON \"app-icon.ico\""]);
     Ok(())
 }
 
@@ -192,7 +178,6 @@ fn windows_static_crt_and_icon_resource_are_explicit() -> Result<()> {
     );
     let resource = fs::read_to_string(root().join("crates/app/resources/windows/app.rc"))?;
     assert!(resource.contains("1 ICON \"app-icon.ico\""));
-    assert!(resource.contains("1 24 \"tgbooks.manifest\""));
     Ok(())
 }
 
